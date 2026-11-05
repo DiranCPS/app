@@ -38,6 +38,8 @@ button { color: inherit; }
 .button-primary { background: var(--green); color: #172012; }
 .button-primary:hover { background: #d2ff92; }
 .button-danger { border-color: #563a37; background: #30211f; color: #e6aaa3; }
+.button-create { border-color: #3b4739; background: #202820; color: #c9ee9e; }
+.button-create:hover { border-color: #52654b; background: #293629; }
 .button-danger:hover { border-color: #80514b; background: #402724; }
 .top-button { height: 31px; font-size: 10px; }
 .top-button svg { width: 13px; height: 13px; }

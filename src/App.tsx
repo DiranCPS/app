@@ -36,6 +36,15 @@ type DirectoryHandle = FileSystemDirectoryHandle & {
 };
 type InstalledVersion = { version: string; jar: File };
 
+declare global {
+  interface Window {
+    prismDesktop?: {
+      getMinecraftVersions(): Promise<string[]>;
+      readMinecraftJar(version: string): Promise<ArrayBuffer>;
+    };
+  }
+}
+
 const assets: Asset[] = [];
 
 const categoryOrder: Category[] = ["블록", "아이템", "엔티티", "인터페이스", "갑옷", "음식", "도구", "자연", "지도", "환경", "효과", "입자", "기타"];
@@ -187,7 +196,7 @@ async function saveTextureLibrary(textures: Asset[]) {
         store.put(stored);
       }
       transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error ?? new Error("텍스처를 브라우저에 저장하지 못했어요."));
+      transaction.onerror = () => reject(transaction.error ?? new Error("텍스처 저장소를 열지 못했어요."));
       transaction.onabort = () => reject(transaction.error ?? new Error("텍스처 저장 공간이 부족하거나 저장이 취소되었어요."));
     });
   } finally {
@@ -475,7 +484,7 @@ function App() {
       await saveSetting("output-directory", null);
       setOutputFolder(null);
       setOutputFolderName("");
-      notify("팩을 브라우저 다운로드 폴더에 저장합니다");
+      notify(window.prismDesktop ? "팩을 앱 다운로드 폴더에 저장합니다" : "팩을 브라우저 다운로드 폴더에 저장합니다");
     } catch (error) {
       notify(error instanceof Error ? `다운로드 위치를 저장하지 못했어요: ${error.message}` : "다운로드 위치를 저장하지 못했어요");
     }
@@ -534,8 +543,9 @@ function App() {
         notify(error instanceof Error ? `저장된 프로젝트 설정을 불러오지 못했어요: ${error.message}` : "저장된 프로젝트 설정을 불러오지 못했어요");
       }
 
+      let savedTextures: Asset[] = [];
       try {
-        const savedTextures = await loadSavedTextures();
+        savedTextures = await loadSavedTextures();
         if (cancelled) {
           savedTextures.forEach((asset) => URL.revokeObjectURL(asset.url));
           return;
@@ -544,7 +554,40 @@ function App() {
         setEdited(new Set(savedIds.filter((id) => savedTextures.some((asset) => asset.id === id))));
         if (savedTextures.length) setSelectedId(savedTextures[0].id);
       } catch (error) {
-        notify(error instanceof Error ? `브라우저에 저장된 텍스처를 불러오지 못했어요: ${error.message}` : "브라우저에 저장된 텍스처를 불러오지 못했어요");
+        notify(error instanceof Error ? `저장된 텍스처를 불러오지 못했어요: ${error.message}` : "저장된 텍스처를 불러오지 못했어요");
+      }
+
+      const desktop = window.prismDesktop;
+      if (desktop) {
+        try {
+          const versions = await desktop.getMinecraftVersions();
+          if (cancelled) return;
+          const installed = versions.map((version) => ({
+            version,
+            jar: new File([], `${version}.jar`, { type: "application/java-archive" }),
+          }));
+          setInstalledVersions(installed);
+          const target = installed.find((item) => item.version === savedPack.version) ?? installed[0];
+          if (!target) {
+            notify("Minecraft 설치 파일(.jar)을 찾지 못했어요. Minecraft Java Edition을 설치하고 게임을 한 번 실행해 주세요.");
+            return;
+          }
+          setMinecraftFolderName(".minecraft");
+          const preservedEdits = savedTextures.filter((asset) => savedIds.includes(asset.id));
+          await importInstalledVersion(target, preservedEdits);
+          if (minecraftVersions.some((item) => item.version === target.version)) {
+            setPack((current) => ({
+              ...current,
+              version: target.version,
+              minVersion: compareVersions(current.minVersion ?? "1.6.1", target.version) > 0
+                ? target.version
+                : current.minVersion ?? "1.6.1",
+            }));
+          }
+        } catch (error) {
+          notify(error instanceof Error ? `Minecraft 설치 파일을 자동으로 불러오지 못했어요: ${error.message}` : "Minecraft 설치 파일을 자동으로 불러오지 못했어요");
+        }
+        return;
       }
 
       try {
@@ -672,14 +715,31 @@ function App() {
       minVersion: compareVersions(current.minVersion ?? "1.6.1", value) > 0 ? value : current.minVersion ?? "1.6.1",
     }));
     const installed = installedVersions.find((item) => item.version === value);
-    if (installed) void importFiles([installed.jar], "vanilla");
+    if (installed) void importInstalledVersion(installed);
+  }
+
+  async function importInstalledVersion(installed: InstalledVersion, preservedEdits?: Asset[]) {
+    try {
+      if (window.prismDesktop) {
+        const buffer = await window.prismDesktop.readMinecraftJar(installed.version);
+        await importFiles(
+          [new File([buffer], `${installed.version}.jar`, { type: "application/java-archive" })],
+          "vanilla",
+          preservedEdits,
+        );
+        return;
+      }
+      await importFiles([installed.jar], "vanilla", preservedEdits);
+    } catch (error) {
+      notify(error instanceof Error ? `Minecraft ${installed.version} 파일을 불러오지 못했어요: ${error.message}` : "Minecraft 파일을 불러오지 못했어요");
+    }
   }
 
   function saveProject() {
     try {
       localStorage.setItem("prism-pack", JSON.stringify(pack));
       localStorage.setItem("prism-edited", JSON.stringify([...edited]));
-      notify("프로젝트를 이 브라우저에 저장했어요");
+      notify("프로젝트를 이 컴퓨터에 저장했어요");
       return true;
     } catch (error) {
       notify(error instanceof Error ? `프로젝트를 저장하지 못했어요: ${error.message}` : "프로젝트를 저장하지 못했어요");
@@ -687,7 +747,7 @@ function App() {
     }
   }
 
-  async function importFiles(files: FileList | File[] | null, kind: "vanilla" | "pack") {
+  async function importFiles(files: FileList | File[] | null, kind: "vanilla" | "pack", preservedEdits?: Asset[]) {
     if (!files?.length) return;
     setLoading(true);
     try {
@@ -711,16 +771,20 @@ function App() {
       if (!additions.length) throw new Error("assets/minecraft/textures 폴더의 PNG 텍스처를 찾지 못했어요.");
       const uniqueAdditions = [...new Map(additions.map((asset) => [asset.path, asset])).values()];
       if (kind === "vanilla") {
-        setImported(uniqueAdditions);
-        setEdited((current) => new Set([...current].filter((id) => uniqueAdditions.some((asset) => asset.id === id))));
-        void saveTextureLibrary(uniqueAdditions).catch((error: unknown) => notify(error instanceof Error ? `불러온 텍스처를 브라우저에 저장하지 못했어요: ${error.message}` : "불러온 텍스처를 브라우저에 저장하지 못했어요"));
+        const preserved = preservedEdits ?? imported.filter((asset) => edited.has(asset.id));
+        const mergedByPath = new Map(uniqueAdditions.map((asset) => [asset.path, asset]));
+        for (const asset of preserved) mergedByPath.set(asset.path, asset);
+        const merged = [...mergedByPath.values()];
+        setImported(merged);
+        setEdited((current) => new Set([...current, ...preserved.map((asset) => asset.id)].filter((id) => merged.some((asset) => asset.id === id))));
+        void saveTextureLibrary(merged).catch((error: unknown) => notify(error instanceof Error ? `불러온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "불러온 텍스처를 저장소에 저장하지 못했어요"));
       } else {
         const byPath = new Map(imported.map((asset) => [asset.path, asset]));
         for (const asset of uniqueAdditions) byPath.set(asset.path, asset);
         const merged = [...byPath.values()];
         setImported(merged);
         setEdited((current) => new Set([...current, ...uniqueAdditions.map((asset) => asset.id)]));
-        void saveTextureLibrary(merged).catch((error: unknown) => notify(error instanceof Error ? `가져온 텍스처를 브라우저에 저장하지 못했어요: ${error.message}` : "가져온 텍스처를 브라우저에 저장하지 못했어요"));
+        void saveTextureLibrary(merged).catch((error: unknown) => notify(error instanceof Error ? `가져온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "가져온 텍스처를 저장소에 저장하지 못했어요"));
       }
       setCategory("전체");
       setSearch("");
@@ -763,7 +827,7 @@ function App() {
     byPath.set(replacement.path, replacement);
     const updated = [...byPath.values()];
     setImported(updated);
-    void saveTextureLibrary(updated).catch((error: unknown) => notify(error instanceof Error ? `교체한 텍스처를 브라우저에 저장하지 못했어요: ${error.message}` : "교체한 텍스처를 브라우저에 저장하지 못했어요"));
+    void saveTextureLibrary(updated).catch((error: unknown) => notify(error instanceof Error ? `교체한 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "교체한 텍스처를 저장소에 저장하지 못했어요"));
     setEdited((current) => new Set([...current, replacement.id]));
     setSelectedId(replacement.id);
     notify(`${replacement.path} 텍스처를 교체했어요`);
@@ -1408,7 +1472,7 @@ function App() {
               <div className="empty-state">
                 <Icon name={allAssets.length ? "search" : "cube"} size={26} />
                 <strong>{allAssets.length ? "검색 결과가 없어요" : "Minecraft 기본 텍스처를 불러오세요"}</strong>
-                <span>{allAssets.length ? "다른 이름이나 카테고리로 찾아보세요." : "게임 버전의 client.jar에서 원본 PNG를 이 브라우저 안에서 읽어옵니다."}</span>
+                <span>{allAssets.length ? "다른 이름이나 카테고리로 찾아보세요." : window.prismDesktop ? "설치된 Minecraft client.jar에서 기본 텍스처를 자동으로 불러옵니다." : "게임 버전의 client.jar에서 원본 PNG를 이 브라우저 안에서 읽어옵니다."}</span>
                 {allAssets.length
                   ? <button className="button button-muted" onClick={() => { setSearch(""); setQuery(""); setCategory("전체"); }}>필터 초기화</button>
                   : <button className="button button-primary" onClick={() => vanillaInput.current?.click()} disabled={loading}><Icon name="upload" /> {loading ? "텍스처 불러오는 중..." : "Minecraft .jar 선택하기"}</button>}
@@ -1509,7 +1573,7 @@ function App() {
             <div className="settings-subheading">리소스팩 저장 위치</div>
             <div className={`destination-option ${!outputFolder ? "destination-selected" : ""}`}>
               <input id="downloads-location" type="radio" name="output-folder" checked={!outputFolder} onChange={() => void useDownloadsFolder()} />
-              <label htmlFor="downloads-location"><strong>다운로드</strong><small>브라우저 기본 다운로드 폴더</small></label>
+              <label htmlFor="downloads-location"><strong>다운로드</strong><small>{window.prismDesktop ? "앱 기본 다운로드 폴더" : "브라우저 기본 다운로드 폴더"}</small></label>
             </div>
             <div className={`destination-option ${outputFolder ? "destination-selected" : ""}`}>
               <input id="custom-location" type="radio" name="output-folder" checked={Boolean(outputFolder)} onChange={() => void chooseOutputFolder()} />

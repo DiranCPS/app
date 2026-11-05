@@ -13,7 +13,7 @@ Open the local URL printed by Vite. To create a production build, run `npm run b
 
 ## Windows desktop app
 
-Download the latest Windows installer from [GitHub Releases](https://github.com/DiranCPS/app/releases/latest). The installer is not code-signed, so Windows may show a SmartScreen warning. To build it locally, install dependencies with `npm install` and run `npm run desktop:build`; the installer is written to `release/`. Run `npm run build` before `npm run desktop` to launch the built app without installing it.
+Download the latest Windows installer from [GitHub Releases](https://github.com/DiranCPS/app/releases/latest). On launch, the desktop app searches `%APPDATA%\.minecraft\versions` and loads the newest installed Minecraft Java texture archive. The installer is not code-signed, so Windows may show a SmartScreen warning. To build it locally, install dependencies with `npm install` and run `npm run desktop:build`; the installer is written to `release/`. Run `npm run build` before `npm run desktop` to launch the built app without installing it.
 
 ## Deploy to GitHub Pages
 
