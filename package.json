@@ -12,7 +12,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "test": "vitest run",
     "desktop": "electron .",
-    "desktop:build": "npm run build && electron-builder --win nsis"
+    "desktop:build": "npm run build && electron-builder --win nsis --publish never"
   },
   "dependencies": {
     "jszip": "^3.10.1",
