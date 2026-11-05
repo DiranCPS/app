@@ -11,6 +11,10 @@ npm run dev
 
 Open the local URL printed by Vite. To create a production build, run `npm run build`.
 
+## Windows desktop app
+
+Download the latest Windows installer from [GitHub Releases](https://github.com/DiranCPS/app/releases/latest). The installer is not code-signed, so Windows may show a SmartScreen warning. To build it locally, install dependencies with `npm install` and run `npm run desktop:build`; the installer is written to `release/`. Run `npm run build` before `npm run desktop` to launch the built app without installing it.
+
 ## Deploy to GitHub Pages
 
 The GitHub Actions workflow builds the app and deploys it to GitHub Pages when changes are pushed to `main` or `master`. In the repository settings, enable **Pages** with **GitHub Actions** as the build and deployment source. The workflow can also be started manually from the Actions tab.
