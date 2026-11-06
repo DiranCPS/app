@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
-import { floodFillPixels, traceLinePixels, type PixelColor } from "./pixel-editor";
+import { floodFillPixels, forEachLinePixel, trimImageHistory, type PixelColor } from "./pixel-editor";
 
 type Category = "블록" | "아이템" | "엔티티" | "인터페이스" | "갑옷" | "음식" | "도구" | "자연" | "지도" | "환경" | "효과" | "입자" | "기타";
 type PackSettings = { name: string; description: string; version: string; minVersion?: string };
-type EditorTool = "pencil" | "eraser" | "fill" | "eyedropper" | "line" | "rectangle" | "select";
+type EditorTool = "pencil" | "eraser" | "fill" | "eyedropper" | "line" | "rectangle" | "select" | "hand";
 type SelectionRect = { x: number; y: number; width: number; height: number };
+type EditorZoomAnchor = { imageX: number; imageY: number; viewportX: number; viewportY: number };
+type EditorPanGesture = { pointerId: number; startX: number; startY: number; scrollLeft: number; scrollTop: number };
 type SelectionTransform = {
   mode: "create" | "move" | "resize";
   anchor: { x: number; y: number };
@@ -29,6 +31,10 @@ type StoredAsset = Omit<Asset, "url">;
 const TEXTURE_DB_NAME = "prism-resource-studio";
 const TEXTURE_STORE_NAME = "textures";
 const SETTINGS_STORE_NAME = "settings";
+const ASSET_PAGE_SIZE = 120;
+const MAX_EDITOR_HISTORY_FRAMES = 30;
+const MAX_EDITOR_HISTORY_BYTES = 16 * 1024 * 1024;
+const EDITOR_PAN_MARGIN = 480;
 type DirectoryHandle = FileSystemDirectoryHandle & {
   values(): AsyncIterableIterator<FileSystemHandle>;
   queryPermission(options: { mode: "read" | "readwrite" }): Promise<PermissionState>;
@@ -183,18 +189,38 @@ async function saveTextureLibrary(textures: Asset[]) {
       const store = transaction.objectStore(TEXTURE_STORE_NAME);
       store.clear();
       for (const asset of textures) {
-        const stored: StoredAsset = {
-          id: asset.id,
-          name: asset.name,
-          koreanName: asset.koreanName,
-          category: asset.category,
-          path: asset.path,
-          blob: asset.blob,
-          width: asset.width,
-          height: asset.height,
-        };
-        store.put(stored);
+        store.put(toStoredAsset(asset));
       }
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error ?? new Error("텍스처 저장소를 열지 못했어요."));
+      transaction.onabort = () => reject(transaction.error ?? new Error("텍스처 저장 공간이 부족하거나 저장이 취소되었어요."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function toStoredAsset(asset: Asset): StoredAsset {
+  return {
+    id: asset.id,
+    name: asset.name,
+    koreanName: asset.koreanName,
+    category: asset.category,
+    path: asset.path,
+    blob: asset.blob,
+    width: asset.width,
+    height: asset.height,
+  };
+}
+
+async function saveTextureAssets(textures: Asset[], deletedPaths: string[] = []) {
+  const database = await openTextureDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(TEXTURE_STORE_NAME, "readwrite");
+      const store = transaction.objectStore(TEXTURE_STORE_NAME);
+      for (const path of deletedPaths) store.delete(path);
+      for (const asset of textures) store.put(toStoredAsset(asset));
       transaction.oncomplete = () => resolve();
       transaction.onerror = () => reject(transaction.error ?? new Error("텍스처 저장소를 열지 못했어요."));
       transaction.onabort = () => reject(transaction.error ?? new Error("텍스처 저장 공간이 부족하거나 저장이 취소되었어요."));
@@ -222,7 +248,7 @@ function relativeTexturePath(entryName: string) {
 
 const initialPack: PackSettings = {
   name: "나만의 리소스팩",
-  description: "Prism으로 만든 나만의 Minecraft 리소스팩",
+  description: "Minecraft Resource Pack Studio로 만든 나만의 리소스팩",
   version: "26.3",
   minVersion: "1.6.1",
 };
@@ -331,13 +357,14 @@ function Icon({ name, size = 16 }: { name: string; size?: number }) {
     select: <><rect x="4" y="4" width="16" height="16" rx="1" strokeDasharray="3 2" /><path d="M8 8h.01M16 8h.01M8 16h.01M16 16h.01" /></>,
     zoomIn: <><circle cx="10.8" cy="10.8" r="6.4" /><path d="m16 16 4 4M10.8 7.8v6m-3-3h6" /></>,
     zoomOut: <><circle cx="10.8" cy="10.8" r="6.4" /><path d="m16 16 4 4m-12-9h6" /></>,
+    hand: <><path d="M8 11V5a1.5 1.5 0 0 1 3 0v5-6a1.5 1.5 0 0 1 3 0v6-5a1.5 1.5 0 0 1 3 0v7-3a1.5 1.5 0 0 1 3 0v5c0 5-3 8-7 8h-1c-2 0-3.5-.8-5-2.5L4 16a1.5 1.5 0 0 1 2.2-2L8 16" /></>,
     checker: <><rect x="3" y="3" width="18" height="18" rx="2" /><path d="M3 9h6v6H3zm12 0h6v6h-6zM9 3h6v6H9zm0 12h6v6H9z" /></>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name] ?? paths.cube}</svg>;
 }
 
 function PixelSprite({ asset, size = 56, onLoad }: { asset: Asset; size?: number; onLoad?: (event: React.SyntheticEvent<HTMLImageElement>) => void }) {
-  return <img className="uploaded-sprite" src={asset.url} alt="" onLoad={onLoad} style={{ width: size, height: size }} />;
+  return <img className="uploaded-sprite" src={asset.url} alt="" loading="lazy" decoding="async" onLoad={onLoad} style={{ width: size, height: size }} />;
 }
 
 const categoryIcons: Partial<Record<Category, string>> = { 블록: "cube", 아이템: "spark", 엔티티: "cube", 인터페이스: "grid", 갑옷: "grid", 자연: "spark", 지도: "grid", 입자: "spark" };
@@ -359,6 +386,7 @@ function App() {
   const [editorPath, setEditorPath] = useState("");
   const [editorTool, setEditorTool] = useState<EditorTool>("pencil");
   const [editorZoom, setEditorZoom] = useState(12);
+  const [editorPanning, setEditorPanning] = useState(false);
   const [editorBrushSize, setEditorBrushSize] = useState(1);
   const [editorOpacity, setEditorOpacity] = useState(100);
   const [editorGrid, setEditorGrid] = useState(true);
@@ -370,6 +398,8 @@ function App() {
   const [sortMode, setSortMode] = useState<"최신순" | "가나다순">("최신순");
   const [toast, setToast] = useState("");
   const [imported, setImported] = useState<Asset[]>([]);
+  const [selectedDimensions, setSelectedDimensions] = useState<{ id: string; width: number; height: number } | null>(null);
+  const [assetLimit, setAssetLimit] = useState(ASSET_PAGE_SIZE);
   const [edited, setEdited] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -379,8 +409,14 @@ function App() {
   const searchInput = useRef<HTMLInputElement>(null);
   const editorCanvas = useRef<HTMLCanvasElement>(null);
   const editorPreviewCanvas = useRef<HTMLCanvasElement>(null);
+  const editorViewport = useRef<HTMLDivElement>(null);
+  const editorStage = useRef<HTMLDivElement>(null);
+  const zoomAnchor = useRef<EditorZoomAnchor | null>(null);
+  const panGesture = useRef<EditorPanGesture | null>(null);
   const editorUndoStack = useRef<ImageData[]>([]);
   const editorRedoStack = useRef<ImageData[]>([]);
+  const importedAssetsRef = useRef(imported);
+  const mountedRef = useRef(false);
   const drawing = useRef(false);
   const editorStart = useRef<{ x: number; y: number } | null>(null);
   const editorEnd = useRef<{ x: number; y: number } | null>(null);
@@ -399,6 +435,18 @@ function App() {
       : filtered;
   }, [allAssets, category, query, sortMode]);
   const selected = allAssets.find((asset) => asset.id === selectedId) ?? allAssets[0];
+  const displayedAssets = useMemo(() => visibleAssets.slice(0, assetLimit), [visibleAssets, assetLimit]);
+  const categoryCounts = useMemo(() => {
+    const counts = new Map<Category, number>();
+    for (const asset of allAssets) counts.set(asset.category, (counts.get(asset.category) ?? 0) + 1);
+    return counts;
+  }, [allAssets]);
+  const selectedWidth = selectedDimensions && selected && selectedDimensions.id === selected.id
+    ? selectedDimensions.width
+    : selected?.width;
+  const selectedHeight = selectedDimensions && selected && selectedDimensions.id === selected.id
+    ? selectedDimensions.height
+    : selected?.height;
   const packAssets = useMemo(() => allAssets.filter((asset) => edited.has(asset.id)), [allAssets, edited]);
   const editedCount = packAssets.length;
   const versionGroups = useMemo(() => {
@@ -414,6 +462,29 @@ function App() {
     setToast(message);
     window.setTimeout(() => setToast(""), 2600);
   }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      const urls = importedAssetsRef.current.map((asset) => asset.url);
+      window.setTimeout(() => {
+        if (!mountedRef.current) urls.forEach((url) => URL.revokeObjectURL(url));
+      }, 0);
+    };
+  }, []);
+
+  useEffect(() => {
+    const retainedUrls = new Set(imported.map((asset) => asset.url));
+    for (const asset of importedAssetsRef.current) {
+      if (!retainedUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
+    }
+    importedAssetsRef.current = imported;
+  }, [imported]);
+
+  useEffect(() => {
+    setAssetLimit(ASSET_PAGE_SIZE);
+  }, [category, query, sortMode]);
 
   async function chooseMinecraftFolder() {
     const picker = (window as Window & {
@@ -655,7 +726,7 @@ function App() {
       } else if (event.key === "Escape") {
         setEditorOpen(false);
       } else if (!event.ctrlKey && !event.metaKey) {
-        const shortcuts: Record<string, EditorTool> = { b: "pencil", e: "eraser", g: "fill", i: "eyedropper", l: "line", u: "rectangle", m: "select" };
+        const shortcuts: Record<string, EditorTool> = { b: "pencil", e: "eraser", g: "fill", i: "eyedropper", l: "line", u: "rectangle", m: "select", h: "hand" };
         const tool = shortcuts[event.key.toLowerCase()];
         if (tool) {
           event.preventDefault();
@@ -673,7 +744,9 @@ function App() {
     const previewCanvas = editorPreviewCanvas.current;
     setEditorDimensions({ width: 0, height: 0 });
     const image = new Image();
+    let cancelled = false;
     image.onload = () => {
+      if (cancelled) return;
       canvas.width = image.naturalWidth;
       canvas.height = image.naturalHeight;
       setEditorDimensions({ width: canvas.width, height: canvas.height });
@@ -697,12 +770,56 @@ function App() {
       selectionImage.current = null;
       setUndoCount(0);
       setRedoCount(0);
-      setEditorZoom(Math.max(1, Math.min(24, Math.floor(520 / Math.max(image.naturalWidth, image.naturalHeight)))));
+      const nextZoom = Math.max(1, Math.min(24, Math.floor(520 / Math.max(image.naturalWidth, image.naturalHeight))));
+      const viewport = editorViewport.current;
+      zoomAnchor.current = {
+        imageX: image.naturalWidth / 2,
+        imageY: image.naturalHeight / 2,
+        viewportX: (viewport?.clientWidth ?? 0) / 2,
+        viewportY: (viewport?.clientHeight ?? 0) / 2,
+      };
+      setEditorZoom(nextZoom);
       drawing.current = false;
     };
-    image.onerror = () => notify("선택한 PNG 텍스처를 편집기로 불러오지 못했어요.");
+    image.onerror = () => { if (!cancelled) notify("선택한 PNG 텍스처를 편집기로 불러오지 못했어요."); };
     image.src = selected.url;
+    return () => {
+      cancelled = true;
+      image.src = "";
+    };
   }, [editorOpen, selected?.url]);
+
+  useLayoutEffect(() => {
+    const viewport = editorViewport.current;
+    const stage = editorStage.current;
+    if (!editorOpen || !editorDimensions.width || !editorDimensions.height || !viewport || !stage) return;
+
+    const anchor = zoomAnchor.current ?? {
+      imageX: editorDimensions.width / 2,
+      imageY: editorDimensions.height / 2,
+      viewportX: viewport.clientWidth / 2,
+      viewportY: viewport.clientHeight / 2,
+    };
+    const maxLeft = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+    const maxTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    viewport.scrollLeft = Math.min(maxLeft, Math.max(0, EDITOR_PAN_MARGIN + anchor.imageX * editorZoom - anchor.viewportX));
+    viewport.scrollTop = Math.min(maxTop, Math.max(0, EDITOR_PAN_MARGIN + anchor.imageY * editorZoom - anchor.viewportY));
+    zoomAnchor.current = null;
+  }, [editorOpen, editorDimensions, editorZoom]);
+
+  useEffect(() => {
+    if (editorOpen) return;
+    editorUndoStack.current = [];
+    editorRedoStack.current = [];
+    setEditorClipboard(null);
+    setEditorSelection(null);
+    selectionTransform.current = null;
+    if (selectionImage.current) {
+      selectionImage.current.width = 0;
+      selectionImage.current.height = 0;
+      selectionImage.current = null;
+    }
+  }, [editorOpen]);
 
   function updatePack(key: "name" | "description" | "version" | "minVersion", value: string) {
     setPack((current) => ({ ...current, [key]: value }));
@@ -750,8 +867,9 @@ function App() {
   async function importFiles(files: FileList | File[] | null, kind: "vanilla" | "pack", preservedEdits?: Asset[]) {
     if (!files?.length) return;
     setLoading(true);
+    const additions: Asset[] = [];
+    let committed = false;
     try {
-      const additions: Asset[] = [];
       for (const file of Array.from(files)) {
         if (/\.(jar|zip)$/i.test(file.name)) {
           const zip = await JSZip.loadAsync(file);
@@ -770,12 +888,21 @@ function App() {
       }
       if (!additions.length) throw new Error("assets/minecraft/textures 폴더의 PNG 텍스처를 찾지 못했어요.");
       const uniqueAdditions = [...new Map(additions.map((asset) => [asset.path, asset])).values()];
+      const retainedAdditionUrls = new Set(uniqueAdditions.map((asset) => asset.url));
+      for (const asset of additions) {
+        if (!retainedAdditionUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
+      }
       if (kind === "vanilla") {
         const preserved = preservedEdits ?? imported.filter((asset) => edited.has(asset.id));
         const mergedByPath = new Map(uniqueAdditions.map((asset) => [asset.path, asset]));
         for (const asset of preserved) mergedByPath.set(asset.path, asset);
         const merged = [...mergedByPath.values()];
+        const mergedUrls = new Set(merged.map((asset) => asset.url));
+        for (const asset of uniqueAdditions) {
+          if (!mergedUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
+        }
         setImported(merged);
+        committed = true;
         setEdited((current) => new Set([...current, ...preserved.map((asset) => asset.id)].filter((id) => merged.some((asset) => asset.id === id))));
         void saveTextureLibrary(merged).catch((error: unknown) => notify(error instanceof Error ? `불러온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "불러온 텍스처를 저장소에 저장하지 못했어요"));
       } else {
@@ -783,8 +910,9 @@ function App() {
         for (const asset of uniqueAdditions) byPath.set(asset.path, asset);
         const merged = [...byPath.values()];
         setImported(merged);
+        committed = true;
         setEdited((current) => new Set([...current, ...uniqueAdditions.map((asset) => asset.id)]));
-        void saveTextureLibrary(merged).catch((error: unknown) => notify(error instanceof Error ? `가져온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "가져온 텍스처를 저장소에 저장하지 못했어요"));
+        void saveTextureAssets(uniqueAdditions).catch((error: unknown) => notify(error instanceof Error ? `가져온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "가져온 텍스처를 저장소에 저장하지 못했어요"));
       }
       setCategory("전체");
       setSearch("");
@@ -794,6 +922,7 @@ function App() {
         ? `${fileNameWithoutExtension(files[0].name)} 기본 텍스처 ${uniqueAdditions.length}개를 불러왔어요`
         : `${uniqueAdditions.length}개의 텍스처를 가져왔어요`);
     } catch (error) {
+      if (!committed) additions.forEach((asset) => URL.revokeObjectURL(asset.url));
       notify(error instanceof Error ? error.message : "파일을 가져오지 못했어요");
     } finally {
       setLoading(false);
@@ -827,7 +956,7 @@ function App() {
     byPath.set(replacement.path, replacement);
     const updated = [...byPath.values()];
     setImported(updated);
-    void saveTextureLibrary(updated).catch((error: unknown) => notify(error instanceof Error ? `교체한 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "교체한 텍스처를 저장소에 저장하지 못했어요"));
+    void saveTextureAssets([replacement]).catch((error: unknown) => notify(error instanceof Error ? `교체한 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "교체한 텍스처를 저장소에 저장하지 못했어요"));
     setEdited((current) => new Set([...current, replacement.id]));
     setSelectedId(replacement.id);
     notify(`${replacement.path} 텍스처를 교체했어요`);
@@ -843,7 +972,7 @@ function App() {
       return;
     }
     try {
-      await saveTextureLibrary(updated);
+      await saveTextureAssets([], [selected.path]);
       setImported(updated);
       setEdited((current) => {
         const next = new Set(current);
@@ -878,7 +1007,7 @@ function App() {
     const context = canvas?.getContext("2d");
     if (!canvas || !context) return;
     editorUndoStack.current.push(context.getImageData(0, 0, canvas.width, canvas.height));
-    if (editorUndoStack.current.length > 30) editorUndoStack.current.shift();
+    trimImageHistory(editorUndoStack.current, MAX_EDITOR_HISTORY_FRAMES, MAX_EDITOR_HISTORY_BYTES);
     editorRedoStack.current = [];
     updateEditorHistoryCounts();
   }
@@ -889,6 +1018,7 @@ function App() {
     const previous = editorUndoStack.current.pop();
     if (!canvas || !context || !previous) return;
     editorRedoStack.current.push(context.getImageData(0, 0, canvas.width, canvas.height));
+    trimImageHistory(editorRedoStack.current, MAX_EDITOR_HISTORY_FRAMES, MAX_EDITOR_HISTORY_BYTES);
     context.putImageData(previous, 0, 0);
     editorPreviewCanvas.current?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
     setEditorSelection(null);
@@ -901,6 +1031,7 @@ function App() {
     const next = editorRedoStack.current.pop();
     if (!canvas || !context || !next) return;
     editorUndoStack.current.push(context.getImageData(0, 0, canvas.width, canvas.height));
+    trimImageHistory(editorUndoStack.current, MAX_EDITOR_HISTORY_FRAMES, MAX_EDITOR_HISTORY_BYTES);
     context.putImageData(next, 0, 0);
     setEditorSelection(null);
     updateEditorHistoryCounts();
@@ -1065,7 +1196,7 @@ function App() {
   }
 
   function drawEditorLine(context: CanvasRenderingContext2D, from: { x: number; y: number }, to: { x: number; y: number }) {
-    for (const point of traceLinePixels(from, to)) drawEditorBrush(context, point.x, point.y);
+    forEachLinePixel(from, to, (x, y) => drawEditorBrush(context, x, y));
   }
 
   function drawEditorShape(context: CanvasRenderingContext2D, start: { x: number; y: number }, end: { x: number; y: number }) {
@@ -1094,6 +1225,7 @@ function App() {
   }
 
   function handleEditorPointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
+    if (editorTool === "hand") return;
     const point = editorCoordinates(event);
     const canvas = editorCanvas.current;
     const context = canvas?.getContext("2d");
@@ -1137,6 +1269,7 @@ function App() {
   }
 
   function handleEditorPointerMove(event: React.PointerEvent<HTMLCanvasElement>) {
+    if (editorTool === "hand") return;
     if (!drawing.current) return;
     const point = editorCoordinates(event);
     const start = editorStart.current;
@@ -1202,6 +1335,45 @@ function App() {
     editorLastPixel.current = null;
   }
 
+  function handleEditorViewportPointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (editorTool !== "hand" || event.button !== 0) return;
+    const viewport = editorViewport.current;
+    if (!viewport) return;
+    event.preventDefault();
+    panGesture.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+    };
+    viewport.setPointerCapture(event.pointerId);
+    setEditorPanning(true);
+  }
+
+  function handleEditorViewportPointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const gesture = panGesture.current;
+    const viewport = editorViewport.current;
+    if (!gesture || !viewport || gesture.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    viewport.scrollLeft = gesture.scrollLeft - (event.clientX - gesture.startX);
+    viewport.scrollTop = gesture.scrollTop - (event.clientY - gesture.startY);
+  }
+
+  function finishEditorPan(event: React.PointerEvent<HTMLDivElement>) {
+    if (panGesture.current?.pointerId !== event.pointerId) return;
+    panGesture.current = null;
+    setEditorPanning(false);
+    const viewport = editorViewport.current;
+    if (viewport?.hasPointerCapture(event.pointerId)) viewport.releasePointerCapture(event.pointerId);
+  }
+
+  function handleEditorWheel(event: React.WheelEvent<HTMLDivElement>) {
+    event.preventDefault();
+    if (event.deltaY === 0) return;
+    zoomEditor(event.deltaY < 0 ? 1 : -1, event.clientX, event.clientY);
+  }
+
   function handleSelectionHandleMove(event: React.PointerEvent<HTMLButtonElement>) {
     updateSelectionResize(event.clientX, event.clientY);
   }
@@ -1242,8 +1414,26 @@ function App() {
     image.src = selected.url;
   }
 
-  function zoomEditor(direction: -1 | 1) {
-    setEditorZoom((current) => Math.min(64, Math.max(1, current + direction * (current < 8 ? 1 : 2))));
+  function zoomEditor(direction: -1 | 1, clientX?: number, clientY?: number) {
+    const viewport = editorViewport.current;
+    const canvas = editorCanvas.current;
+    if (!viewport || !canvas) return;
+    const nextZoom = Math.min(64, Math.max(1, editorZoom + direction * (editorZoom < 8 ? 1 : 2)));
+    if (nextZoom === editorZoom) {
+      zoomAnchor.current = null;
+      return;
+    }
+    const viewportRect = viewport.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    const viewportX = clientX === undefined ? viewport.clientWidth / 2 : clientX - viewportRect.left;
+    const viewportY = clientY === undefined ? viewport.clientHeight / 2 : clientY - viewportRect.top;
+    zoomAnchor.current = {
+      imageX: (viewportX - (canvasRect.left - viewportRect.left)) / editorZoom,
+      imageY: (viewportY - (canvasRect.top - viewportRect.top)) / editorZoom,
+      viewportX,
+      viewportY,
+    };
+    setEditorZoom(nextZoom);
   }
 
   async function saveEditedTexture() {
@@ -1270,7 +1460,7 @@ function App() {
       setImported(updated);
       setSelectedId(editedAsset.id);
       setEdited((current) => new Set([...current, editedAsset.id]));
-      await saveTextureLibrary(updated);
+      await saveTextureAssets([editedAsset]);
       setEditorOpen(false);
       notify(`${path} 텍스처를 저장했어요`);
     } catch (error) {
@@ -1302,7 +1492,7 @@ function App() {
     setEditorPath(path);
     setEditorOpen(true);
     try {
-      await saveTextureLibrary(updated);
+      await saveTextureAssets([asset]);
     } catch (error) {
       notify(error instanceof Error ? `새 텍스처를 저장하지 못했어요: ${error.message}` : "새 텍스처를 저장하지 못했어요");
     }
@@ -1334,12 +1524,10 @@ function App() {
 
   function recordTextureDimensions(asset: Asset, event: React.SyntheticEvent<HTMLImageElement>) {
     const { naturalWidth, naturalHeight } = event.currentTarget;
-    if (asset.width === naturalWidth && asset.height === naturalHeight) return;
-    const updated = imported.map((item) => item.path === asset.path
-      ? { ...item, width: naturalWidth, height: naturalHeight }
-      : item);
-    setImported(updated);
-    void saveTextureLibrary(updated).catch((error: unknown) => notify(error instanceof Error ? `텍스처 정보를 저장하지 못했어요: ${error.message}` : "텍스처 정보를 저장하지 못했어요"));
+    setSelectedDimensions((current) => current?.id === asset.id &&
+      current.width === naturalWidth && current.height === naturalHeight
+      ? current
+      : { id: asset.id, width: naturalWidth, height: naturalHeight });
   }
 
   async function textureBlob(asset: Asset) {
@@ -1387,9 +1575,9 @@ function App() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <a className="brand" href="#" aria-label="Prism Resource Studio 홈">
+        <a className="brand" href="#" aria-label="Minecraft Resource Pack Studio 홈">
           <span className="brand-mark"><Icon name="cube" size={20} /></span>
-          <span className="brand-word">PRISM <i>/ RESOURCE STUDIO</i></span>
+          <span className="brand-word">MINECRAFT <i>/ RESOURCE PACK STUDIO</i></span>
         </a>
         <div className="top-actions">
           <span className="workspace-label"><span className="status-dot" /> 로컬 워크스페이스</span>
@@ -1419,7 +1607,7 @@ function App() {
             <div className="nav-caption nav-caption-spaced">카테고리 <span>{categoryOrder.length}</span></div>
             {categoryOrder.map((item) => (
               <button key={item} className={`nav-row ${category === item ? "active" : ""}`} onClick={() => setCategory(item)}>
-                <Icon name={categoryIcons[item] ?? "cube"} size={15} /> {item}<span>{allAssets.filter((asset) => asset.category === item).length}</span>
+                <Icon name={categoryIcons[item] ?? "cube"} size={15} /> {item}<span>{categoryCounts.get(item) ?? 0}</span>
               </button>
             ))}
             <button className="nav-row" onClick={() => fileInput.current?.click()}><Icon name="plus" size={15} /> 리소스팩에서 가져오기 <span>ZIP</span></button>
@@ -1461,7 +1649,7 @@ function App() {
             </div>
             {visibleAssets.length ? (
               <div className="asset-grid">
-                {visibleAssets.map((asset) => (
+                {displayedAssets.map((asset) => (
                   <button key={asset.id} className={`asset-card ${selectedId === asset.id ? "selected" : ""}`} onClick={() => setSelectedId(asset.id)}>
                     <span className="asset-thumb"><PixelSprite asset={asset} size={66} /><span className="asset-hover"><Icon name="spark" size={14} /></span></span>
                     <span className="asset-meta"><strong>{asset.name}</strong><span>{asset.category} <i>·</i> {asset.path}</span></span>
@@ -1479,7 +1667,12 @@ function App() {
                 {!allAssets.length && <small className="jar-help">%APPDATA%\.minecraft\versions\버전\버전.jar</small>}
               </div>
             )}
-            <div className="library-bottom"><span>PRISM RESOURCE LIBRARY</span><span>{allAssets.length} ASSETS <b>·</b> ORIGINAL PNG PATHS</span></div>
+            {displayedAssets.length < visibleAssets.length && (
+              <button className="button button-muted load-more-button" onClick={() => setAssetLimit((current) => current + ASSET_PAGE_SIZE)}>
+                더 불러오기 ({visibleAssets.length - displayedAssets.length}개 남음)
+              </button>
+            )}
+            <div className="library-bottom"><span>MINECRAFT RESOURCE PACK STUDIO</span><span>{allAssets.length} ASSETS <b>·</b> ORIGINAL PNG PATHS</span></div>
           </div>
         </section>
 
@@ -1489,7 +1682,7 @@ function App() {
           <div className="preview-stage">
             <div className="preview-grid" />
             <div className="preview-tile">{selected ? <PixelSprite asset={selected} size={zoom * 18} onLoad={(event) => recordTextureDimensions(selected, event)} /> : <span className="preview-empty"><Icon name="cube" size={30} /></span>}</div>
-            <span className="preview-dim">{selected?.width && selected?.height ? `${selected.width} × ${selected.height}` : "PNG"}</span>
+            <span className="preview-dim">{selectedWidth && selectedHeight ? `${selectedWidth} × ${selectedHeight}` : "PNG"}</span>
           </div>
           <div className="zoom-row"><span>미리보기 크기</span><div><button aria-label="축소" onClick={() => setZoom((value) => Math.max(2, value - 1))}>−</button><span>{zoom}×</span><button aria-label="확대" onClick={() => setZoom((value) => Math.min(7, value + 1))}>+</button></div></div>
 
@@ -1498,7 +1691,7 @@ function App() {
             {selected ? <>
               <div className="selected-resource"><div className="selected-icon"><PixelSprite asset={selected} size={34} /></div><div><strong>{selected.koreanName}</strong><small>{selected.name}</small></div><span className="category-badge">{selected.category}</span></div>
               <label className="field-label">리소스팩 경로</label><div className="file-name-field"><strong>assets/minecraft/textures/{selected.path}</strong></div>
-              <div className="field-pair">              <div><label className="field-label">크기</label><strong>{selected.width && selected.height ? `${selected.width} × ${selected.height} px` : "원본 PNG"}</strong></div><div><label className="field-label">형식</label><strong>PNG 이미지</strong></div></div>
+              <div className="field-pair">              <div><label className="field-label">크기</label><strong>{selectedWidth && selectedHeight ? `${selectedWidth} × ${selectedHeight} px` : "원본 PNG"}</strong></div><div><label className="field-label">형식</label><strong>PNG 이미지</strong></div></div>
               <div className="preview-actions">
                 <button className="button button-primary" onClick={openTextureEditor}><Icon name="pencil" size={14} /> 기본 텍스처 수정</button>
                 <button className="button button-primary" onClick={() => replaceInput.current?.click()}><Icon name="upload" size={14} /> 파일 교체</button>
@@ -1610,6 +1803,7 @@ function App() {
                 <div className="editor-panel-caption">도구</div>
                 <div className="editor-tool-list">
                   {([
+                    ["hand", "손 도구", "H"],
                     ["select", "사각형 선택", "M"],
                     ["pencil", "연필", "B"],
                     ["eraser", "지우개", "E"],
@@ -1658,8 +1852,24 @@ function App() {
                   </div>
                   <button className={`editor-grid-toggle ${editorGrid ? "editor-grid-active" : ""}`} aria-pressed={editorGrid} onClick={() => setEditorGrid((current) => !current)}><Icon name="checker" size={14} /> 픽셀 격자</button>
                 </div>
-                <div className="editor-canvas-viewport">
-                  <div className={`editor-canvas-stack ${!editorDimensions.width ? "editor-canvas-loading" : ""} ${editorGrid && editorZoom >= 6 ? "editor-pixel-grid" : ""}`} style={{ width: Math.max(1, editorDimensions.width * editorZoom), height: Math.max(1, editorDimensions.height * editorZoom), "--editor-zoom": `${editorZoom}px` } as React.CSSProperties}>
+                <div
+                  ref={editorViewport}
+                  className={`editor-canvas-viewport ${editorTool === "hand" ? "editor-hand-tool" : ""} ${editorPanning ? "editor-panning" : ""}`}
+                  onWheel={handleEditorWheel}
+                  onPointerDown={handleEditorViewportPointerDown}
+                  onPointerMove={handleEditorViewportPointerMove}
+                  onPointerUp={finishEditorPan}
+                  onPointerCancel={finishEditorPan}
+                >
+                  <div
+                    ref={editorStage}
+                    className="editor-canvas-stage"
+                    style={{
+                      width: Math.max(1, editorDimensions.width * editorZoom) + EDITOR_PAN_MARGIN * 2,
+                      height: Math.max(1, editorDimensions.height * editorZoom) + EDITOR_PAN_MARGIN * 2,
+                    }}
+                  >
+                    <div className={`editor-canvas-stack ${!editorDimensions.width ? "editor-canvas-loading" : ""} ${editorGrid && editorZoom >= 6 ? "editor-pixel-grid" : ""}`} style={{ left: EDITOR_PAN_MARGIN, top: EDITOR_PAN_MARGIN, width: Math.max(1, editorDimensions.width * editorZoom), height: Math.max(1, editorDimensions.height * editorZoom), "--editor-zoom": `${editorZoom}px` } as React.CSSProperties}>
                     <canvas ref={editorCanvas} aria-label="픽셀 텍스처 편집 캔버스" onPointerDown={handleEditorPointerDown} onPointerMove={handleEditorPointerMove} onPointerUp={handleEditorPointerUp} onPointerCancel={handleEditorPointerUp} />
                     <canvas ref={editorPreviewCanvas} className="editor-shape-preview" aria-hidden="true" />
                     {editorSelection && (
@@ -1669,12 +1879,13 @@ function App() {
                         ))}
                       </div>
                     )}
+                    </div>
                   </div>
                   {!editorDimensions.width && <div className="editor-loading">텍스처 불러오는 중...</div>}
                 </div>
                 <footer className="editor-statusbar">
                   <span>{editorDimensions.width || selected.width || "—"} × {editorDimensions.height || selected.height || "—"} px</span>
-                  <span>{editorTool === "select" ? "사각형 선택" : editorTool === "pencil" ? "연필" : editorTool === "eraser" ? "지우개" : editorTool === "fill" ? "색 채우기" : editorTool === "eyedropper" ? "색 추출" : editorTool === "line" ? "직선" : "사각형"}</span>
+                  <span>{editorTool === "select" ? "사각형 선택" : editorTool === "pencil" ? "연필" : editorTool === "eraser" ? "지우개" : editorTool === "fill" ? "색 채우기" : editorTool === "eyedropper" ? "색 추출" : editorTool === "line" ? "직선" : editorTool === "hand" ? "손 도구 · 드래그하여 이동" : "사각형"}</span>
                   <span>{Math.round(editorZoom * 100)}%</span>
                 </footer>
               </div>
@@ -1682,8 +1893,8 @@ function App() {
                 <div className="editor-panel-caption">미리보기</div>
                 <div className="editor-reference-preview"><PixelSprite asset={selected} size={96} /></div>
                 <strong className="editor-reference-name">{selected.koreanName}</strong>
-                <span className="editor-reference-category">{selected.category} · {selected.width ?? "?"} × {selected.height ?? "?"} px</span>
-                <div className="editor-reference-tip"><Icon name="info" size={14} /> 투명 배경은 체크무늬로 표시됩니다. Ctrl+Z로 실행 취소, Ctrl+Y로 다시 실행할 수 있어요.</div>
+                <span className="editor-reference-category">{selected.category} · {selectedWidth ?? "?"} × {selectedHeight ?? "?"} px</span>
+                <div className="editor-reference-tip"><Icon name="info" size={14} /> 휠로 마우스 위치를 기준으로 확대·축소하고, 손 도구(H)를 선택해 드래그하면 이미지 크기를 바꾸지 않고 작업 화면을 이동합니다. Ctrl+Z로 실행 취소, Ctrl+Y로 다시 실행할 수 있어요.</div>
               </aside>
             </div>
             <footer className="editor-bottom-bar">

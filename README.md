@@ -1,6 +1,6 @@
-# Prism — Minecraft Resource Studio
+# Minecraft Resource Pack Studio
 
-A local-first, Korean-language texture library and resource pack studio for Minecraft Java Edition.
+A local-first, Korean-language texture library and resource pack studio for Minecraft Java Edition. The texture library loads cards in batches, saves only changed textures after edits, and caps each undo/redo history at 16 MB.
 
 ## Run locally
 

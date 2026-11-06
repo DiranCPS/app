@@ -110,6 +110,7 @@ kbd { flex: 0 0 auto; padding: 3px 5px; border: 1px solid #364039; border-radius
 .asset-meta strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d9e0d7; font-family: "DM Mono", monospace; font-size: 8px; font-weight: 500; }
 .asset-meta span { overflow: hidden; color: #7d887d; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
 .asset-meta i { padding: 0 3px; color: #4e5a4f; font-style: normal; }
+.load-more-button { display: block; min-width: 180px; margin: 18px auto 0; }
 .empty-state { min-height: 270px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 11px; color: #788279; }
 .empty-state strong { color: #dce3db; font-size: 13px; }
 .empty-state span { font-size: 10px; }
@@ -261,8 +262,18 @@ kbd { flex: 0 0 auto; padding: 3px 5px; border: 1px solid #364039; border-radius
 .editor-zoom-controls span { min-width: 35px; text-align: center; }
 .editor-grid-toggle { height: 27px; display: flex; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid #303a32; border-radius: 5px; background: #1d251f; color: #9da89c; cursor: pointer; font-size: 8px; }
 .editor-grid-active { color: #c8ec9e; border-color: #48583e; }
-.editor-canvas-viewport { position: relative; min-height: 0; flex: 1; display: grid; place-items: center; overflow: auto; padding: 24px; background-color: #1b221c; background-image: linear-gradient(45deg, #303a32 25%, transparent 25%), linear-gradient(-45deg, #303a32 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #303a32 75%), linear-gradient(-45deg, transparent 75%, #303a32 75%); background-size: 32px 32px; background-position: 0 0, 0 16px, 16px -16px, -16px 0; }
-.editor-canvas-stack { position: relative; flex: 0 0 auto; box-shadow: 0 12px 35px #0008; }
+.editor-canvas-viewport { position: relative; min-width: 0; min-height: 0; flex: 1; overflow: auto; background-color: #1b221c; background-image: linear-gradient(45deg, #303a32 25%, transparent 25%), linear-gradient(-45deg, #303a32 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #303a32 75%), linear-gradient(-45deg, transparent 75%, #303a32 75%); background-size: 32px 32px; background-position: 0 0, 0 16px, 16px -16px, -16px 0; scrollbar-color: #59665a #1b221c; scrollbar-width: auto; }
+.editor-canvas-viewport::-webkit-scrollbar { width: 15px; height: 15px; background: #1b221c; }
+.editor-canvas-viewport::-webkit-scrollbar-track { background: #1b221c; }
+.editor-canvas-viewport::-webkit-scrollbar-thumb { border: 3px solid #1b221c; border-radius: 9px; background: #59665a; }
+.editor-canvas-viewport::-webkit-scrollbar-thumb:hover { background: #758272; }
+.editor-canvas-viewport::-webkit-scrollbar-corner { background: #1b221c; }
+.editor-hand-tool { cursor: grab; }
+.editor-hand-tool .editor-canvas-stack { cursor: grab; }
+.editor-hand-tool .editor-canvas-stack canvas { cursor: grab; }
+.editor-panning, .editor-panning .editor-canvas-stack, .editor-panning .editor-canvas-stack canvas { cursor: grabbing !important; }
+.editor-canvas-stage { position: relative; min-width: calc(100% + 960px); min-height: calc(100% + 960px); flex: 0 0 auto; }
+.editor-canvas-stack { position: absolute; flex: 0 0 auto; box-shadow: 0 12px 35px #0008; }
 .editor-canvas-loading { visibility: hidden; }
 .editor-canvas-stack canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; image-rendering: pixelated; touch-action: none; }
 .editor-canvas-stack canvas:first-child { cursor: crosshair; }

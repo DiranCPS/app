@@ -1,6 +1,6 @@
 // Runtime validation coverage for pixel drawing and bucket-fill behavior.
 import { describe, expect, it } from "vitest";
-import { floodFillPixels, traceLinePixels } from "./pixel-editor";
+import { floodFillPixels, traceLinePixels, trimImageHistory } from "./pixel-editor";
 
 describe("pixel editor drawing", () => {
   it("traces a continuous diagonal line between pixel coordinates", () => {
@@ -31,7 +31,34 @@ describe("pixel editor drawing", () => {
     expect([...pixels]).toEqual([10, 20, 30, 255]);
   });
 
+  it("does not fill when the requested color clamps to the existing color", () => {
+    const pixels = new Uint8ClampedArray([255, 0, 0, 255]);
+
+    expect(floodFillPixels(pixels, 1, 1, 0, 0, [300, 0, 0, 255])).toBe(false);
+    expect([...pixels]).toEqual([255, 0, 0, 255]);
+  });
+
   it("rejects a fill origin outside the texture", () => {
     expect(() => floodFillPixels(new Uint8ClampedArray(4), 1, 1, 1, 0, [0, 0, 0, 255])).toThrow(RangeError);
+  });
+
+  it("keeps recent undo frames within the frame and memory limits", () => {
+    const history = [
+      { data: { byteLength: 8 } },
+      { data: { byteLength: 8 } },
+      { data: { byteLength: 8 } },
+    ];
+
+    trimImageHistory(history, 2, 16);
+
+    expect(history).toEqual([{ data: { byteLength: 8 } }, { data: { byteLength: 8 } }]);
+  });
+
+  it("drops older frames when a single frame exceeds the memory limit", () => {
+    const history = [{ data: { byteLength: 8 } }, { data: { byteLength: 24 } }];
+
+    trimImageHistory(history, 30, 16);
+
+    expect(history).toEqual([]);
   });
 });
