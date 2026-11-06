@@ -17,7 +17,7 @@ Download the latest Windows installer from [GitHub Releases](https://github.com/
 
 ## Deploy to GitHub Pages
 
-The GitHub Actions workflow builds the app and deploys it to GitHub Pages when changes are pushed to `main` or `master`. In the repository settings, enable **Pages** with **GitHub Actions** as the build and deployment source. The workflow can also be started manually from the Actions tab.
+The GitHub Actions workflow builds the app and deploys it to GitHub Pages when changes are pushed to `main` or `master`. In the repository settings, enable **Pages** with **GitHub Actions** as the build and deployment source. The workflow can also be started manually from the Actions tab. Windows desktop release bundles are additionally obfuscated during packaging; the public repository source and GitHub Pages source remain readable.
 
 ## Features
 
