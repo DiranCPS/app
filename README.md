@@ -25,11 +25,13 @@ The GitHub Actions workflow builds the app and deploys it to GitHub Pages when c
 - Browse and search texture categories including blocks, items, entities, interface, armor, food, tools, nature, maps, environment, effects, and particles.
 - Preview selected textures and adjust preview zoom.
 - Replace a texture with a PNG while preserving its exact `assets/minecraft/textures/...` resource-pack path.
+- Rename a texture's resource-pack path and save multiple named project snapshots that can be reloaded later.
 - Import PNG textures individually or merge textures from another resource-pack ZIP.
 - Edit textures in a Paint-like pixel workspace with rectangular selection, move/resize and cut/copy/paste, pencil, eraser, fill, color picker, line and rectangle tools, opacity and brush-size controls, a color palette, zoom, pixel grid, undo/redo, and transparent-canvas support; create new 16 × 16 PNG textures and download an individual PNG.
 - Delete imported textures from the library and remove them from the exported pack overrides.
 - Choose Minecraft Java versions by release family, from 1.6.x through 1.21.x and 26.x, and set a minimum supported version for the selected range.
 - Open pack settings from the gear beside export to edit pack metadata, locate the `.minecraft` folder, or choose where exported packs are saved.
-- Save the local texture library in browser storage, and export selected overrides as a Minecraft resource-pack ZIP with `pack.mcmeta`.
+- Persist pack metadata as it changes and restore the selected export folder when the app starts.
+- Save the local texture library and named projects in browser storage. Reimporting a vanilla JAR/ZIP replaces matching edited textures with the source files; automatic startup and version changes preserve matching edits. Export selected overrides as a Minecraft resource-pack ZIP with `pack.mcmeta`.
 
 To load the vanilla textures, choose the `.minecraft` folder in pack settings or select a version JAR, usually at `%APPDATA%\.minecraft\versions\<version>\<version>.jar`. Browsers require you to grant folder access; after permission is granted, the app remembers the folder handle and can search it when it starts again. Exports go to the browser's Downloads location by default, or to a folder you choose in settings. The app reads game archives locally in your browser.

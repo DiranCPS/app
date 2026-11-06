@@ -1,9 +1,11 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
 import { floodFillPixels, forEachLinePixel, trimImageHistory, type PixelColor } from "./pixel-editor";
+import { mergeVanillaTextures } from "./texture-import";
 
 type Category = "블록" | "아이템" | "엔티티" | "인터페이스" | "갑옷" | "음식" | "도구" | "자연" | "지도" | "환경" | "효과" | "입자" | "기타";
 type PackSettings = { name: string; description: string; version: string; minVersion?: string };
+type SavedProject = { id: string; name: string; updatedAt: number; pack: PackSettings; assets: StoredAsset[] };
 type EditorTool = "pencil" | "eraser" | "fill" | "eyedropper" | "line" | "rectangle" | "select" | "hand";
 type SelectionRect = { x: number; y: number; width: number; height: number };
 type EditorZoomAnchor = { imageX: number; imageY: number; viewportX: number; viewportY: number };
@@ -31,6 +33,7 @@ type StoredAsset = Omit<Asset, "url">;
 const TEXTURE_DB_NAME = "prism-resource-studio";
 const TEXTURE_STORE_NAME = "textures";
 const SETTINGS_STORE_NAME = "settings";
+const PROJECT_STORE_NAME = "projects";
 const ASSET_PAGE_SIZE = 120;
 const MAX_EDITOR_HISTORY_FRAMES = 30;
 const MAX_EDITOR_HISTORY_BYTES = 16 * 1024 * 1024;
@@ -90,13 +93,16 @@ function fileNameWithoutExtension(filename: string) {
 
 function openTextureDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(TEXTURE_DB_NAME, 2);
+    const request = indexedDB.open(TEXTURE_DB_NAME, 3);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(TEXTURE_STORE_NAME)) {
         request.result.createObjectStore(TEXTURE_STORE_NAME, { keyPath: "path" });
       }
       if (!request.result.objectStoreNames.contains(SETTINGS_STORE_NAME)) {
         request.result.createObjectStore(SETTINGS_STORE_NAME, { keyPath: "key" });
+      }
+      if (!request.result.objectStoreNames.contains(PROJECT_STORE_NAME)) {
+        request.result.createObjectStore(PROJECT_STORE_NAME, { keyPath: "id" });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -124,6 +130,49 @@ async function saveSetting(key: string, value: unknown) {
       const request = database.transaction(SETTINGS_STORE_NAME, "readwrite").objectStore(SETTINGS_STORE_NAME).put({ key, value });
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error ?? new Error("설정을 저장하지 못했어요."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function loadSavedProjects() {
+  const database = await openTextureDatabase();
+  try {
+    return await new Promise<SavedProject[]>((resolve, reject) => {
+      const request = database.transaction(PROJECT_STORE_NAME, "readonly").objectStore(PROJECT_STORE_NAME).getAll();
+      request.onsuccess = () => resolve((request.result as SavedProject[]).sort((left, right) => right.updatedAt - left.updatedAt));
+      request.onerror = () => reject(request.error ?? new Error("저장된 프로젝트 목록을 불러오지 못했어요."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function saveStoredProject(project: SavedProject) {
+  const database = await openTextureDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(PROJECT_STORE_NAME, "readwrite");
+      transaction.objectStore(PROJECT_STORE_NAME).put(project);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error ?? new Error("프로젝트를 저장하지 못했어요."));
+      transaction.onabort = () => reject(transaction.error ?? new Error("프로젝트 저장이 취소되었어요."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function deleteStoredProject(id: string) {
+  const database = await openTextureDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(PROJECT_STORE_NAME, "readwrite");
+      transaction.objectStore(PROJECT_STORE_NAME).delete(id);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error ?? new Error("프로젝트를 삭제하지 못했어요."));
+      transaction.onabort = () => reject(transaction.error ?? new Error("프로젝트 삭제가 취소되었어요."));
     });
   } finally {
     database.close();
@@ -372,6 +421,12 @@ const categoryIcons: Partial<Record<Category, string>> = { 블록: "cube", 아�
 function App() {
   const [pack, setPack] = useState(initialPack);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [projectManagerOpen, setProjectManagerOpen] = useState(false);
+  const [savedProjects, setSavedProjects] = useState<SavedProject[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState("");
+  const [projectName, setProjectName] = useState("");
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renamePath, setRenamePath] = useState("");
   const [minecraftFolderName, setMinecraftFolderName] = useState("");
   const [outputFolder, setOutputFolder] = useState<DirectoryHandle | null>(null);
   const [outputFolderName, setOutputFolderName] = useState("");
@@ -503,12 +558,12 @@ function App() {
       setMinecraftFolderName(handle.name);
       setInstalledVersions(versions);
       const target = versions.find((item) => item.version === pack.version) ?? versions[0];
-      setPack((current) => ({
-        ...current,
+      persistPackSettings({
+        ...pack,
         version: target.version,
-        minVersion: compareVersions(current.minVersion ?? "1.6.1", target.version) > 0 ? target.version : current.minVersion ?? "1.6.1",
-      }));
-      await importFiles([target.jar], "vanilla");
+        minVersion: compareVersions(pack.minVersion ?? "1.6.1", target.version) > 0 ? target.version : pack.minVersion ?? "1.6.1",
+      });
+      await importFiles([target.jar], "vanilla", undefined, true);
       notify(`Minecraft ${target.version}를 자동으로 찾았어요`);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -524,9 +579,9 @@ function App() {
       ...current.filter((item) => item.version !== version),
     ]);
     if (minecraftVersions.some((item) => item.version === version)) {
-      setPack((current) => ({ ...current, version }));
+      persistPackSettings({ ...pack, version });
     }
-    await importFiles([file], "vanilla");
+    await importFiles([file], "vanilla", undefined, true);
     if (manualJarInput.current) manualJarInput.current.value = "";
   }
 
@@ -628,9 +683,60 @@ function App() {
         notify(error instanceof Error ? `저장된 텍스처를 불러오지 못했어요: ${error.message}` : "저장된 텍스처를 불러오지 못했어요");
       }
 
+      try {
+        const projects = await loadSavedProjects();
+        if (cancelled) return;
+        setSavedProjects(projects);
+        const activeId = localStorage.getItem("prism-active-project") ?? "";
+        const activeProject = projects.find((project) => project.id === activeId);
+        if (activeProject) {
+          setActiveProjectId(activeProject.id);
+          setProjectName(activeProject.name);
+        }
+      } catch (error) {
+        notify(error instanceof Error ? `저장된 프로젝트 목록을 불러오지 못했어요: ${error.message}` : "저장된 프로젝트 목록을 불러오지 못했어요");
+      }
+
+      try {
+        const savedOutput = await getSavedSetting<DirectoryHandle | null>("output-directory");
+        if (savedOutput) {
+          setOutputFolder(savedOutput);
+          setOutputFolderName(savedOutput.name);
+        } else {
+          setOutputFolder(null);
+          setOutputFolderName("");
+        }
+      } catch (error) {
+        notify(error instanceof Error ? `저장 위치 설정을 불러오지 못했어요: ${error.message}` : "저장 위치 설정을 불러오지 못했어요");
+      }
+
       const desktop = window.prismDesktop;
       if (desktop) {
         try {
+          let savedMinecraftDirectory: DirectoryHandle | undefined;
+          try {
+            savedMinecraftDirectory = await getSavedSetting<DirectoryHandle>("minecraft-directory");
+          } catch (error) {
+            notify(error instanceof Error ? `Minecraft 폴더 설정을 불러오지 못했어요: ${error.message}` : "Minecraft 폴더 설정을 불러오지 못했어요");
+          }
+          if (savedMinecraftDirectory) {
+            try {
+              if (await savedMinecraftDirectory.queryPermission({ mode: "read" }) === "granted") {
+                const directoryVersions = await findMinecraftJars(savedMinecraftDirectory);
+                if (cancelled) return;
+                setMinecraftFolderName(savedMinecraftDirectory.name);
+                setInstalledVersions(directoryVersions);
+                const target = directoryVersions.find((item) => item.version === savedPack.version) ?? directoryVersions[0];
+                if (target) {
+                  const preservedEdits = savedTextures.filter((asset) => savedIds.includes(asset.id));
+                  await importFiles([target.jar], "vanilla", preservedEdits);
+                  return;
+                }
+              }
+            } catch (error) {
+              notify(error instanceof Error ? `저장된 Minecraft 폴더를 열지 못했어요: ${error.message}` : "저장된 Minecraft 폴더를 열지 못했어요");
+            }
+          }
           const versions = await desktop.getMinecraftVersions();
           if (cancelled) return;
           const installed = versions.map((version) => ({
@@ -646,15 +752,6 @@ function App() {
           setMinecraftFolderName(".minecraft");
           const preservedEdits = savedTextures.filter((asset) => savedIds.includes(asset.id));
           await importInstalledVersion(target, preservedEdits);
-          if (minecraftVersions.some((item) => item.version === target.version)) {
-            setPack((current) => ({
-              ...current,
-              version: target.version,
-              minVersion: compareVersions(current.minVersion ?? "1.6.1", target.version) > 0
-                ? target.version
-                : current.minVersion ?? "1.6.1",
-            }));
-          }
         } catch (error) {
           notify(error instanceof Error ? `Minecraft 설치 파일을 자동으로 불러오지 못했어요: ${error.message}` : "Minecraft 설치 파일을 자동으로 불러오지 못했어요");
         }
@@ -663,11 +760,6 @@ function App() {
 
       try {
         const minecraftDirectory = await getSavedSetting<DirectoryHandle>("minecraft-directory");
-        const savedOutput = await getSavedSetting<DirectoryHandle>("output-directory");
-        if (savedOutput) {
-          setOutputFolder(savedOutput);
-          setOutputFolderName(savedOutput.name);
-        }
         if (minecraftDirectory) {
           setMinecraftFolderName(minecraftDirectory.name);
           const permission = await minecraftDirectory.queryPermission({ mode: "read" });
@@ -677,9 +769,6 @@ function App() {
               setInstalledVersions(versions);
               const target = versions.find((item) => item.version === savedPack.version) ?? versions[0];
               if (target) {
-                if (minecraftVersions.some((item) => item.version === target.version)) {
-                  setPack((current) => ({ ...current, version: target.version }));
-                }
                 await importFiles([target.jar], "vanilla");
               } else {
                 setSettingsOpen(true);
@@ -821,16 +910,25 @@ function App() {
     }
   }, [editorOpen]);
 
+  function persistPackSettings(nextPack: PackSettings) {
+    setPack(nextPack);
+    try {
+      localStorage.setItem("prism-pack", JSON.stringify(nextPack));
+    } catch (error) {
+      notify(error instanceof Error ? `팩 설정을 저장하지 못했어요: ${error.message}` : "팩 설정을 저장하지 못했어요");
+    }
+  }
+
   function updatePack(key: "name" | "description" | "version" | "minVersion", value: string) {
-    setPack((current) => ({ ...current, [key]: value }));
+    persistPackSettings({ ...pack, [key]: value });
   }
 
   function choosePackVersion(value: string) {
-    setPack((current) => ({
-      ...current,
+    persistPackSettings({
+      ...pack,
       version: value,
-      minVersion: compareVersions(current.minVersion ?? "1.6.1", value) > 0 ? value : current.minVersion ?? "1.6.1",
-    }));
+      minVersion: compareVersions(pack.minVersion ?? "1.6.1", value) > 0 ? value : pack.minVersion ?? "1.6.1",
+    });
     const installed = installedVersions.find((item) => item.version === value);
     if (installed) void importInstalledVersion(installed);
   }
@@ -864,7 +962,136 @@ function App() {
     }
   }
 
-  async function importFiles(files: FileList | File[] | null, kind: "vanilla" | "pack", preservedEdits?: Asset[]) {
+  function createProjectSnapshot(id: string, name: string): SavedProject {
+    return {
+      id,
+      name,
+      updatedAt: Date.now(),
+      pack: { ...pack },
+      assets: packAssets.map(toStoredAsset),
+    };
+  }
+
+  async function refreshSavedProjects() {
+    try {
+      setSavedProjects(await loadSavedProjects());
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "저장된 프로젝트 목록을 불러오지 못했어요.");
+    }
+  }
+
+  function openProjectManager() {
+    setProjectName(savedProjects.find((project) => project.id === activeProjectId)?.name ?? pack.name);
+    setProjectManagerOpen(true);
+    void refreshSavedProjects();
+  }
+
+  async function saveManagedProject(asNew = false) {
+    const currentProject = savedProjects.find((project) => project.id === activeProjectId);
+    const name = (asNew ? projectName : currentProject?.name ?? projectName).trim() || pack.name.trim() || "나만의 리소스팩";
+    const id = !asNew && currentProject ? currentProject.id : crypto.randomUUID();
+    try {
+      const project = createProjectSnapshot(id, name);
+      await saveStoredProject(project);
+      const updated = [project, ...savedProjects.filter((item) => item.id !== id)].sort((left, right) => right.updatedAt - left.updatedAt);
+      setSavedProjects(updated);
+      setActiveProjectId(id);
+      setProjectName(name);
+      if (!saveProject()) {
+        notify("프로젝트 저장은 완료했지만 현재 작업 상태를 빠른 저장하지 못했어요.");
+        return;
+      }
+      localStorage.setItem("prism-active-project", id);
+      notify(`"${name}" 프로젝트를 저장했어요`);
+    } catch (error) {
+      notify(error instanceof Error ? `프로젝트를 저장하지 못했어요: ${error.message}` : "프로젝트를 저장하지 못했어요");
+    }
+  }
+
+  async function loadManagedProject(project: SavedProject) {
+    try {
+      const byPath = new Map(imported.map((asset) => [asset.path.toLowerCase(), asset]));
+      const projectAssets = project.assets.map((asset): Asset => ({
+        ...asset,
+        category: categoryForTexture(asset.path),
+        url: "",
+      }));
+      await saveTextureAssets(projectAssets);
+      const loadedAssets = projectAssets.map((asset) => ({ ...asset, url: URL.createObjectURL(asset.blob) }));
+      for (const asset of loadedAssets) byPath.set(asset.path.toLowerCase(), asset);
+      const merged = [...byPath.values()];
+      try {
+        localStorage.setItem("prism-pack", JSON.stringify(project.pack));
+        localStorage.setItem("prism-edited", JSON.stringify(loadedAssets.map((asset) => asset.id)));
+        localStorage.setItem("prism-active-project", project.id);
+      } catch (error) {
+        loadedAssets.forEach((asset) => URL.revokeObjectURL(asset.url));
+        throw error;
+      }
+      setImported(merged);
+      setPack({ ...initialPack, ...project.pack });
+      setEdited(new Set(loadedAssets.map((asset) => asset.id)));
+      setSelectedId(loadedAssets[0]?.id ?? merged[0]?.id ?? "");
+      setCategory("전체");
+      setSearch("");
+      setQuery("");
+      setActiveProjectId(project.id);
+      setProjectName(project.name);
+      notify(`"${project.name}" 프로젝트를 다시 불러왔어요`);
+    } catch (error) {
+      notify(error instanceof Error ? `프로젝트를 불러오지 못했어요: ${error.message}` : "프로젝트를 불러오지 못했어요");
+    }
+  }
+
+  async function removeManagedProject(project: SavedProject) {
+    if (!window.confirm(`"${project.name}" 프로젝트를 삭제할까요?`)) return;
+    try {
+      await deleteStoredProject(project.id);
+      setSavedProjects((current) => current.filter((item) => item.id !== project.id));
+      if (activeProjectId === project.id) {
+        setActiveProjectId("");
+        localStorage.removeItem("prism-active-project");
+      }
+      notify(`"${project.name}" 프로젝트를 삭제했어요`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "프로젝트를 삭제하지 못했어요");
+    }
+  }
+
+  async function renameSelectedTexture() {
+    if (!selected) return;
+    const path = renamePath.trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/^assets\/minecraft\/textures\//i, "");
+    if (!path.toLowerCase().endsWith(".png") || path.split("/").includes("..") || path.split("/").some((part) => !part)) {
+      notify("텍스처 이름은 textures 폴더 안의 올바른 PNG 경로여야 해요.");
+      return;
+    }
+    if (imported.some((asset) => asset.path.toLowerCase() === path.toLowerCase() && asset.id !== selected.id)) {
+      notify("같은 경로의 텍스처가 이미 있어요.");
+      return;
+    }
+    const filename = path.split("/").pop() ?? path;
+    const name = filename.replace(/\.png$/i, "");
+    const renamed: Asset = {
+      ...selected,
+      id: path.toLowerCase(),
+      path,
+      name,
+      koreanName: name.replace(/[_-]+/g, " "),
+      category: categoryForTexture(path),
+    };
+    try {
+      await saveTextureAssets([renamed], [selected.path]);
+      setImported((current) => current.map((asset) => asset.id === selected.id ? renamed : asset));
+      setEdited((current) => new Set([...current].filter((id) => id !== selected.id).concat(renamed.id)));
+      setSelectedId(renamed.id);
+      setRenameOpen(false);
+      notify(`텍스처 이름을 "${name}"(으)로 변경했어요`);
+    } catch (error) {
+      notify(error instanceof Error ? `텍스처 이름을 변경하지 못했어요: ${error.message}` : "텍스처 이름을 변경하지 못했어요");
+    }
+  }
+
+  async function importFiles(files: FileList | File[] | null, kind: "vanilla" | "pack", preservedEdits?: Asset[], overwriteMatchingEdits = false) {
     if (!files?.length) return;
     setLoading(true);
     const additions: Asset[] = [];
@@ -887,23 +1114,21 @@ function App() {
         }
       }
       if (!additions.length) throw new Error("assets/minecraft/textures 폴더의 PNG 텍스처를 찾지 못했어요.");
-      const uniqueAdditions = [...new Map(additions.map((asset) => [asset.path, asset])).values()];
+      const uniqueAdditions = [...new Map(additions.map((asset) => [asset.path.toLowerCase(), asset])).values()];
       const retainedAdditionUrls = new Set(uniqueAdditions.map((asset) => asset.url));
       for (const asset of additions) {
         if (!retainedAdditionUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
       }
       if (kind === "vanilla") {
-        const preserved = preservedEdits ?? imported.filter((asset) => edited.has(asset.id));
-        const mergedByPath = new Map(uniqueAdditions.map((asset) => [asset.path, asset]));
-        for (const asset of preserved) mergedByPath.set(asset.path, asset);
-        const merged = [...mergedByPath.values()];
+        const mergedResult = mergeVanillaTextures(uniqueAdditions, imported, edited, preservedEdits, overwriteMatchingEdits);
+        const merged = mergedResult.textures;
         const mergedUrls = new Set(merged.map((asset) => asset.url));
         for (const asset of uniqueAdditions) {
           if (!mergedUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
         }
         setImported(merged);
         committed = true;
-        setEdited((current) => new Set([...current, ...preserved.map((asset) => asset.id)].filter((id) => merged.some((asset) => asset.id === id))));
+        setEdited(mergedResult.editedIds);
         void saveTextureLibrary(merged).catch((error: unknown) => notify(error instanceof Error ? `불러온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "불러온 텍스처를 저장소에 저장하지 못했어요"));
       } else {
         const byPath = new Map(imported.map((asset) => [asset.path, asset]));
@@ -1517,7 +1742,7 @@ function App() {
 
   function copySelectedToNewPack() {
     if (!selected) return;
-    setPack((current) => ({ ...current, name: `${selected.name} 리소스팩` }));
+    persistPackSettings({ ...pack, name: `${selected.name} 리소스팩` });
     setEdited(new Set([selected.id]));
     notify("선택한 텍스처를 새 리소스팩으로 복사했어요");
   }
@@ -1587,7 +1812,7 @@ function App() {
           <button className="button button-primary top-button" onClick={() => void exportPack()} disabled={loading}><Icon name="download" /> {loading ? "준비 중..." : "팩 내보내기"}</button>
           <button className="button button-muted settings-trigger" aria-label="팩 설정 열기" title="팩 설정" onClick={() => setSettingsOpen(true)}><Icon name="settings" size={17} /></button>
         </div>
-        <input ref={vanillaInput} className="visually-hidden" type="file" accept=".jar,.zip,application/java-archive,application/zip" onChange={(event) => void importFiles(event.target.files, "vanilla")} />
+        <input ref={vanillaInput} className="visually-hidden" type="file" accept=".jar,.zip,application/java-archive,application/zip" onChange={(event) => void importFiles(event.target.files, "vanilla", undefined, true)} />
         <input ref={manualJarInput} className="visually-hidden" type="file" accept=".jar,application/java-archive,application/zip" onChange={(event) => void chooseManualMinecraftJar(event.target.files?.[0])} />
         <input ref={fileInput} className="visually-hidden" type="file" accept=".png,.zip,image/png,application/zip" multiple onChange={(event) => void importFiles(event.target.files, "pack")} />
         <input ref={replaceInput} className="visually-hidden" type="file" accept=".png,image/png" onChange={(event) => replaceSelectedTexture(event.target.files?.[0])} />
@@ -1610,6 +1835,7 @@ function App() {
                 <Icon name={categoryIcons[item] ?? "cube"} size={15} /> {item}<span>{categoryCounts.get(item) ?? 0}</span>
               </button>
             ))}
+            <button className="nav-row" onClick={openProjectManager}><Icon name="grid" size={15} /> 프로젝트 관리<span>{savedProjects.length}</span></button>
             <button className="nav-row" onClick={() => fileInput.current?.click()}><Icon name="plus" size={15} /> 리소스팩에서 가져오기 <span>ZIP</span></button>
           </div>
           <div className="sidebar-footer">
@@ -1691,6 +1917,7 @@ function App() {
             {selected ? <>
               <div className="selected-resource"><div className="selected-icon"><PixelSprite asset={selected} size={34} /></div><div><strong>{selected.koreanName}</strong><small>{selected.name}</small></div><span className="category-badge">{selected.category}</span></div>
               <label className="field-label">리소스팩 경로</label><div className="file-name-field"><strong>assets/minecraft/textures/{selected.path}</strong></div>
+              <button className="button button-muted resource-rename-button" onClick={() => { setRenamePath(selected.path); setRenameOpen(true); }}><Icon name="pencil" size={13} /> 텍스처 이름 변경</button>
               <div className="field-pair">              <div><label className="field-label">크기</label><strong>{selectedWidth && selectedHeight ? `${selectedWidth} × ${selectedHeight} px` : "원본 PNG"}</strong></div><div><label className="field-label">형식</label><strong>PNG 이미지</strong></div></div>
               <div className="preview-actions">
                 <button className="button button-primary" onClick={openTextureEditor}><Icon name="pencil" size={14} /> 기본 텍스처 수정</button>
@@ -1711,6 +1938,59 @@ function App() {
           <div className="inspector-bottom"><span className="status-dot" /> {editedCount}개 리소스가 팩에 준비됨</div>
         </aside>
       </div>
+      {projectManagerOpen && (
+        <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setProjectManagerOpen(false); }}>
+          <section className="settings-modal project-manager-modal" role="dialog" aria-modal="true" aria-labelledby="project-manager-title">
+            <div className="editor-header">
+              <div><span className="eyebrow">PROJECT MANAGEMENT</span><h2 id="project-manager-title">프로젝트 관리</h2></div>
+              <button className="icon-button" aria-label="프로젝트 관리 닫기" onClick={() => setProjectManagerOpen(false)}><Icon name="close" /></button>
+            </div>
+            <label className="field-label" htmlFor="managed-project-name">프로젝트 이름</label>
+            <input id="managed-project-name" className="settings-input" value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="프로젝트 이름" />
+            <div className="project-save-actions">
+              <button className="button button-primary" onClick={() => void saveManagedProject()} disabled={loading}><Icon name="check" size={14} /> 현재 프로젝트 저장</button>
+              <button className="button button-muted" onClick={() => void saveManagedProject(true)} disabled={loading}><Icon name="plus" size={14} /> 새 프로젝트로 저장</button>
+              <button className="button button-muted" onClick={() => void refreshSavedProjects()}><Icon name="redo" size={14} /> 목록 새로고침</button>
+            </div>
+            <div className="settings-divider" />
+            <div className="project-list-heading"><strong>저장된 프로젝트</strong><span>{savedProjects.length}개</span></div>
+            {savedProjects.length ? (
+              <div className="saved-project-list">
+                {savedProjects.map((project) => (
+                  <article key={project.id} className={`saved-project-card ${project.id === activeProjectId ? "saved-project-active" : ""}`}>
+                    <div className="saved-project-info">
+                      <strong>{project.name}</strong>
+                      <small>{project.pack.version} · {project.assets.length}개 텍스처 · {new Date(project.updatedAt).toLocaleString()}</small>
+                    </div>
+                    {project.id === activeProjectId && <span className="saved-project-current">현재</span>}
+                    <div className="saved-project-actions">
+                      <button className="button button-muted" onClick={() => void loadManagedProject(project)}><Icon name="redo" size={13} /> 다시 불러오기</button>
+                      <button className="button button-danger" aria-label={`${project.name} 삭제`} onClick={() => void removeManagedProject(project)}><Icon name="trash" size={13} /></button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : <p className="project-list-empty">저장된 프로젝트가 없어요. 위에서 현재 프로젝트를 저장해 보세요.</p>}
+          </section>
+        </div>
+      )}
+      {renameOpen && selected && (
+        <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setRenameOpen(false); }}>
+          <section className="settings-modal rename-modal" role="dialog" aria-modal="true" aria-labelledby="rename-title">
+            <div className="editor-header">
+              <div><span className="eyebrow">TEXTURE NAME</span><h2 id="rename-title">텍스처 이름 변경</h2></div>
+              <button className="icon-button" aria-label="이름 변경 닫기" onClick={() => setRenameOpen(false)}><Icon name="close" /></button>
+            </div>
+            <label className="field-label" htmlFor="rename-texture-path">텍스처 파일 이름 또는 경로</label>
+            <input id="rename-texture-path" className="settings-input" value={renamePath} onChange={(event) => setRenamePath(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void renameSelectedTexture(); }} autoFocus />
+            <p className="settings-help">textures 폴더 기준 경로를 입력하고 .png로 끝내 주세요. 폴더 경로도 함께 바꿀 수 있어요.</p>
+            <div className="editor-footer">
+              <button className="button button-muted" onClick={() => setRenameOpen(false)}>취소</button>
+              <button className="button button-primary" onClick={() => void renameSelectedTexture()}><Icon name="check" size={14} /> 이름 변경</button>
+            </div>
+          </section>
+        </div>
+      )}
       {settingsOpen && (
         <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget && saveProject()) setSettingsOpen(false); }}>
           <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
