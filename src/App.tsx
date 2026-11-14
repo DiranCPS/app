@@ -1,11 +1,11 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
 import { floodFillPixels, forEachLinePixel, trimImageHistory, type PixelColor } from "./pixel-editor";
-import { mergeVanillaTextures } from "./texture-import";
+import { canReuseVanillaTextures, mergeVanillaTextures } from "./texture-import";
 
 type Category = "블록" | "아이템" | "엔티티" | "인터페이스" | "갑옷" | "음식" | "도구" | "자연" | "지도" | "환경" | "효과" | "입자" | "기타";
 type PackSettings = { name: string; description: string; version: string; minVersion?: string };
-type SavedProject = { id: string; name: string; updatedAt: number; pack: PackSettings; assets: StoredAsset[] };
+type SavedProject = { id: string; name: string; updatedAt: number; pack: PackSettings; assetCount: number; assets?: StoredAsset[] };
 type EditorTool = "pencil" | "eraser" | "fill" | "eyedropper" | "line" | "rectangle" | "select" | "hand";
 type SelectionRect = { x: number; y: number; width: number; height: number };
 type EditorZoomAnchor = { imageX: number; imageY: number; viewportX: number; viewportY: number };
@@ -23,18 +23,20 @@ type Asset = {
   koreanName: string;
   category: Category;
   path: string;
-  blob: Blob;
-  url: string;
+  blob?: Blob;
+  url?: string;
   width?: number;
   height?: number;
 };
-type StoredAsset = Omit<Asset, "url">;
+type StoredAsset = Omit<Asset, "url" | "blob"> & { blob: Blob };
 
 const TEXTURE_DB_NAME = "prism-resource-studio";
 const TEXTURE_STORE_NAME = "textures";
 const SETTINGS_STORE_NAME = "settings";
 const PROJECT_STORE_NAME = "projects";
-const ASSET_PAGE_SIZE = 120;
+const VANILLA_VERSION_SETTING = "vanilla-texture-version";
+const ASSET_PAGE_SIZE = 60;
+const ZIP_EXTRACTION_BATCH_SIZE = 4;
 const MAX_EDITOR_HISTORY_FRAMES = 30;
 const MAX_EDITOR_HISTORY_BYTES = 16 * 1024 * 1024;
 const EDITOR_PAN_MARGIN = 480;
@@ -140,9 +142,44 @@ async function loadSavedProjects() {
   const database = await openTextureDatabase();
   try {
     return await new Promise<SavedProject[]>((resolve, reject) => {
-      const request = database.transaction(PROJECT_STORE_NAME, "readonly").objectStore(PROJECT_STORE_NAME).getAll();
-      request.onsuccess = () => resolve((request.result as SavedProject[]).sort((left, right) => right.updatedAt - left.updatedAt));
+      const request = database.transaction(PROJECT_STORE_NAME, "readonly").objectStore(PROJECT_STORE_NAME).openCursor();
+      const projects: SavedProject[] = [];
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve(projects.sort((left, right) => right.updatedAt - left.updatedAt));
+          return;
+        }
+        const project = cursor.value as SavedProject;
+        projects.push({
+          id: project.id,
+          name: project.name,
+          updatedAt: project.updatedAt,
+          pack: project.pack,
+          assetCount: project.assetCount ?? project.assets?.length ?? 0,
+        });
+        cursor.continue();
+      };
       request.onerror = () => reject(request.error ?? new Error("저장된 프로젝트 목록을 불러오지 못했어요."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function loadStoredProject(id: string) {
+  const database = await openTextureDatabase();
+  try {
+    return await new Promise<SavedProject>((resolve, reject) => {
+      const request = database.transaction(PROJECT_STORE_NAME, "readonly").objectStore(PROJECT_STORE_NAME).get(id);
+      request.onsuccess = () => {
+        if (!request.result) {
+          reject(new Error("저장된 프로젝트를 찾지 못했어요."));
+          return;
+        }
+        resolve(request.result as SavedProject);
+      };
+      request.onerror = () => reject(request.error ?? new Error("저장된 프로젝트를 읽지 못했어요."));
     });
   } finally {
     database.close();
@@ -214,14 +251,25 @@ async function loadSavedTextures() {
   const database = await openTextureDatabase();
   try {
     return await new Promise<Asset[]>((resolve, reject) => {
-      const request = database.transaction(TEXTURE_STORE_NAME, "readonly").objectStore(TEXTURE_STORE_NAME).getAll();
+      const request = database.transaction(TEXTURE_STORE_NAME, "readonly").objectStore(TEXTURE_STORE_NAME).openCursor();
+      const textures: Asset[] = [];
       request.onsuccess = () => {
-        const saved = request.result as StoredAsset[];
-        resolve(saved.map((asset) => ({
-          ...asset,
-          category: categoryForTexture(asset.path),
-          url: URL.createObjectURL(asset.blob),
-        })));
+        const cursor = request.result;
+        if (!cursor) {
+          resolve(textures);
+          return;
+        }
+        const stored = cursor.value as StoredAsset;
+        textures.push({
+          id: stored.id,
+          name: stored.name,
+          koreanName: stored.koreanName,
+          category: categoryForTexture(stored.path),
+          path: stored.path,
+          width: stored.width,
+          height: stored.height,
+        });
+        cursor.continue();
       };
       request.onerror = () => reject(request.error ?? new Error("저장된 텍스처를 읽지 못했어요."));
     });
@@ -230,15 +278,44 @@ async function loadSavedTextures() {
   }
 }
 
-async function saveTextureLibrary(textures: Asset[]) {
+async function getSavedTextureBlob(path: string) {
+  const database = await openTextureDatabase();
+  try {
+    return await new Promise<Blob>((resolve, reject) => {
+      const request = database.transaction(TEXTURE_STORE_NAME, "readonly").objectStore(TEXTURE_STORE_NAME).get(path);
+      request.onsuccess = () => {
+        const asset = request.result as StoredAsset | undefined;
+        if (!asset?.blob) {
+          reject(new Error(`저장된 ${path} 텍스처를 찾지 못했어요.`));
+          return;
+        }
+        resolve(asset.blob);
+      };
+      request.onerror = () => reject(request.error ?? new Error("저장된 텍스처를 읽지 못했어요."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function saveTextureLibrary(textures: StoredAsset[], retainedPaths: string[]) {
   const database = await openTextureDatabase();
   try {
     await new Promise<void>((resolve, reject) => {
       const transaction = database.transaction(TEXTURE_STORE_NAME, "readwrite");
       const store = transaction.objectStore(TEXTURE_STORE_NAME);
-      store.clear();
+      const retained = new Set(retainedPaths.map((path) => path.toLowerCase()));
+      const cursorRequest = store.openCursor();
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (!cursor) return;
+        const asset = cursor.value as StoredAsset;
+        if (!retained.has(asset.path.toLowerCase())) cursor.delete();
+        cursor.continue();
+      };
+      cursorRequest.onerror = () => transaction.abort();
       for (const asset of textures) {
-        store.put(toStoredAsset(asset));
+        store.put(asset);
       }
       transaction.oncomplete = () => resolve();
       transaction.onerror = () => reject(transaction.error ?? new Error("텍스처 저장소를 열지 못했어요."));
@@ -250,6 +327,7 @@ async function saveTextureLibrary(textures: Asset[]) {
 }
 
 function toStoredAsset(asset: Asset): StoredAsset {
+  if (!asset.blob) throw new Error(`저장할 ${asset.path} 텍스처 데이터가 없어요.`);
   return {
     id: asset.id,
     name: asset.name,
@@ -257,6 +335,18 @@ function toStoredAsset(asset: Asset): StoredAsset {
     category: asset.category,
     path: asset.path,
     blob: asset.blob,
+    width: asset.width,
+    height: asset.height,
+  };
+}
+
+function withoutTexturePayload(asset: Asset): Asset {
+  return {
+    id: asset.id,
+    name: asset.name,
+    koreanName: asset.koreanName,
+    category: asset.category,
+    path: asset.path,
     width: asset.width,
     height: asset.height,
   };
@@ -279,12 +369,12 @@ async function saveTextureAssets(textures: Asset[], deletedPaths: string[] = [])
   }
 }
 
-function textureEntries(zip: JSZip) {
+function textureEntryNames(zip: JSZip) {
   const prefixes = ["assets/minecraft/textures/", "minecraft/textures/", "textures/"];
   return Object.values(zip.files).filter((entry) =>
     !entry.dir && entry.name.toLowerCase().endsWith(".png") &&
     prefixes.some((prefix) => entry.name.toLowerCase().startsWith(prefix))
-  );
+  ).map((entry) => entry.name);
 }
 
 function relativeTexturePath(entryName: string) {
@@ -413,7 +503,54 @@ function Icon({ name, size = 16 }: { name: string; size?: number }) {
 }
 
 function PixelSprite({ asset, size = 56, onLoad }: { asset: Asset; size?: number; onLoad?: (event: React.SyntheticEvent<HTMLImageElement>) => void }) {
-  return <img className="uploaded-sprite" src={asset.url} alt="" loading="lazy" decoding="async" onLoad={onLoad} style={{ width: size, height: size }} />;
+  const image = useRef<HTMLImageElement>(null);
+
+  useEffect(() => {
+    const element = image.current;
+    if (!element) return;
+    let objectUrl: string | undefined;
+    let cancelled = false;
+    let intersecting = false;
+    let loadRequest = 0;
+    const releaseTexture = () => {
+      if (!objectUrl) return;
+      element.removeAttribute("src");
+      URL.revokeObjectURL(objectUrl);
+      objectUrl = undefined;
+    };
+    const loadTexture = async () => {
+      const request = ++loadRequest;
+      try {
+        const blob = asset.blob ?? await getSavedTextureBlob(asset.path);
+        if (cancelled || !intersecting || request !== loadRequest) return;
+        objectUrl = URL.createObjectURL(blob);
+        element.src = objectUrl;
+      } catch (error) {
+        console.error(`텍스처 미리보기를 불러오지 못했습니다: ${asset.path}`, error);
+        if (!cancelled && request === loadRequest) element.removeAttribute("src");
+      }
+    };
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      intersecting = entry.isIntersecting;
+      if (intersecting && !objectUrl) {
+        void loadTexture();
+      } else if (!intersecting) {
+        loadRequest++;
+        releaseTexture();
+      }
+    }, { rootMargin: "160px" });
+    observer.observe(element);
+    return () => {
+      cancelled = true;
+      loadRequest++;
+      observer.disconnect();
+      releaseTexture();
+    };
+  }, [asset.blob, asset.path]);
+
+  return <img ref={image} className="uploaded-sprite" alt="" loading="lazy" decoding="async" onLoad={onLoad} style={{ width: size, height: size }} />;
 }
 
 const categoryIcons: Partial<Record<Category, string>> = { 블록: "cube", 아이템: "spark", 엔티티: "cube", 인터페이스: "grid", 갑옷: "grid", 자연: "spark", 지도: "grid", 입자: "spark" };
@@ -522,7 +659,7 @@ function App() {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      const urls = importedAssetsRef.current.map((asset) => asset.url);
+      const urls = importedAssetsRef.current.flatMap((asset) => asset.url ? [asset.url] : []);
       window.setTimeout(() => {
         if (!mountedRef.current) urls.forEach((url) => URL.revokeObjectURL(url));
       }, 0);
@@ -530,9 +667,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const retainedUrls = new Set(imported.map((asset) => asset.url));
+    const retainedUrls = new Set(imported.flatMap((asset) => asset.url ? [asset.url] : []));
     for (const asset of importedAssetsRef.current) {
-      if (!retainedUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
+      if (asset.url && !retainedUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
     }
     importedAssetsRef.current = imported;
   }, [imported]);
@@ -670,10 +807,10 @@ function App() {
       }
 
       let savedTextures: Asset[] = [];
+      let cachedVanillaVersion: string | undefined;
       try {
         savedTextures = await loadSavedTextures();
         if (cancelled) {
-          savedTextures.forEach((asset) => URL.revokeObjectURL(asset.url));
           return;
         }
         setImported(savedTextures);
@@ -681,6 +818,11 @@ function App() {
         if (savedTextures.length) setSelectedId(savedTextures[0].id);
       } catch (error) {
         notify(error instanceof Error ? `저장된 텍스처를 불러오지 못했어요: ${error.message}` : "저장된 텍스처를 불러오지 못했어요");
+      }
+      try {
+        cachedVanillaVersion = await getSavedSetting<string>(VANILLA_VERSION_SETTING);
+      } catch (error) {
+        notify(error instanceof Error ? `기본 텍스처 캐시 정보를 불러오지 못했어요: ${error.message}` : "기본 텍스처 캐시 정보를 불러오지 못했어요");
       }
 
       try {
@@ -728,6 +870,7 @@ function App() {
                 setInstalledVersions(directoryVersions);
                 const target = directoryVersions.find((item) => item.version === savedPack.version) ?? directoryVersions[0];
                 if (target) {
+                  if (canReuseVanillaTextures(cachedVanillaVersion, target.version, savedTextures.length)) return;
                   const preservedEdits = savedTextures.filter((asset) => savedIds.includes(asset.id));
                   await importFiles([target.jar], "vanilla", preservedEdits);
                   return;
@@ -750,6 +893,7 @@ function App() {
             return;
           }
           setMinecraftFolderName(".minecraft");
+          if (canReuseVanillaTextures(cachedVanillaVersion, target.version, savedTextures.length)) return;
           const preservedEdits = savedTextures.filter((asset) => savedIds.includes(asset.id));
           await importInstalledVersion(target, preservedEdits);
         } catch (error) {
@@ -769,6 +913,7 @@ function App() {
               setInstalledVersions(versions);
               const target = versions.find((item) => item.version === savedPack.version) ?? versions[0];
               if (target) {
+                if (canReuseVanillaTextures(cachedVanillaVersion, target.version, savedTextures.length)) return;
                 await importFiles([target.jar], "vanilla");
               } else {
                 setSettingsOpen(true);
@@ -834,6 +979,7 @@ function App() {
     setEditorDimensions({ width: 0, height: 0 });
     const image = new Image();
     let cancelled = false;
+    let objectUrl: string | undefined;
     image.onload = () => {
       if (cancelled) return;
       canvas.width = image.naturalWidth;
@@ -871,12 +1017,22 @@ function App() {
       drawing.current = false;
     };
     image.onerror = () => { if (!cancelled) notify("선택한 PNG 텍스처를 편집기로 불러오지 못했어요."); };
-    image.src = selected.url;
+    void (async () => {
+      try {
+        const blob = selected.blob ?? await getSavedTextureBlob(selected.path);
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        image.src = objectUrl;
+      } catch (error) {
+        if (!cancelled) notify(error instanceof Error ? error.message : "선택한 텍스처를 불러오지 못했어요.");
+      }
+    })();
     return () => {
       cancelled = true;
       image.src = "";
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [editorOpen, selected?.url]);
+  }, [editorOpen, selected?.id]);
 
   useLayoutEffect(() => {
     const viewport = editorViewport.current;
@@ -962,13 +1118,17 @@ function App() {
     }
   }
 
-  function createProjectSnapshot(id: string, name: string): SavedProject {
+  async function createProjectSnapshot(id: string, name: string): Promise<SavedProject> {
     return {
       id,
       name,
       updatedAt: Date.now(),
       pack: { ...pack },
-      assets: packAssets.map(toStoredAsset),
+      assetCount: packAssets.length,
+      assets: await Promise.all(packAssets.map(async (asset) => toStoredAsset({
+        ...asset,
+        blob: await textureBlob(asset),
+      }))),
     };
   }
 
@@ -991,9 +1151,16 @@ function App() {
     const name = (asNew ? projectName : currentProject?.name ?? projectName).trim() || pack.name.trim() || "나만의 리소스팩";
     const id = !asNew && currentProject ? currentProject.id : crypto.randomUUID();
     try {
-      const project = createProjectSnapshot(id, name);
+      const project = await createProjectSnapshot(id, name);
       await saveStoredProject(project);
-      const updated = [project, ...savedProjects.filter((item) => item.id !== id)].sort((left, right) => right.updatedAt - left.updatedAt);
+      const summary: SavedProject = {
+        id: project.id,
+        name: project.name,
+        updatedAt: project.updatedAt,
+        pack: project.pack,
+        assetCount: project.assetCount,
+      };
+      const updated = [summary, ...savedProjects.filter((item) => item.id !== id)].sort((left, right) => right.updatedAt - left.updatedAt);
       setSavedProjects(updated);
       setActiveProjectId(id);
       setProjectName(name);
@@ -1010,26 +1177,26 @@ function App() {
 
   async function loadManagedProject(project: SavedProject) {
     try {
+      const storedProject = await loadStoredProject(project.id);
+      if (!storedProject.assets) throw new Error("프로젝트 텍스처 데이터가 없어요.");
       const byPath = new Map(imported.map((asset) => [asset.path.toLowerCase(), asset]));
-      const projectAssets = project.assets.map((asset): Asset => ({
+      const projectAssets = storedProject.assets.map((asset): Asset => ({
         ...asset,
         category: categoryForTexture(asset.path),
-        url: "",
       }));
       await saveTextureAssets(projectAssets);
-      const loadedAssets = projectAssets.map((asset) => ({ ...asset, url: URL.createObjectURL(asset.blob) }));
+      const loadedAssets = projectAssets.map(withoutTexturePayload);
       for (const asset of loadedAssets) byPath.set(asset.path.toLowerCase(), asset);
       const merged = [...byPath.values()];
       try {
-        localStorage.setItem("prism-pack", JSON.stringify(project.pack));
+        localStorage.setItem("prism-pack", JSON.stringify(storedProject.pack));
         localStorage.setItem("prism-edited", JSON.stringify(loadedAssets.map((asset) => asset.id)));
         localStorage.setItem("prism-active-project", project.id);
       } catch (error) {
-        loadedAssets.forEach((asset) => URL.revokeObjectURL(asset.url));
         throw error;
       }
       setImported(merged);
-      setPack({ ...initialPack, ...project.pack });
+      setPack({ ...initialPack, ...storedProject.pack });
       setEdited(new Set(loadedAssets.map((asset) => asset.id)));
       setSelectedId(loadedAssets[0]?.id ?? merged[0]?.id ?? "");
       setCategory("전체");
@@ -1080,7 +1247,8 @@ function App() {
       category: categoryForTexture(path),
     };
     try {
-      await saveTextureAssets([renamed], [selected.path]);
+      const blob = selected.blob ?? await getSavedTextureBlob(selected.path);
+      await saveTextureAssets([{ ...renamed, blob }], [selected.path]);
       setImported((current) => current.map((asset) => asset.id === selected.id ? renamed : asset));
       setEdited((current) => new Set([...current].filter((id) => id !== selected.id).concat(renamed.id)));
       setSelectedId(renamed.id);
@@ -1100,9 +1268,21 @@ function App() {
       for (const file of Array.from(files)) {
         if (/\.(jar|zip)$/i.test(file.name)) {
           const zip = await JSZip.loadAsync(file);
-          for (const entry of textureEntries(zip)) {
-            const blob = await entry.async("blob");
-            additions.push(makeImportedAsset(relativeTexturePath(entry.name), blob));
+          const entryNames = textureEntryNames(zip);
+          for (let index = 0; index < entryNames.length; index += ZIP_EXTRACTION_BATCH_SIZE) {
+            const batchNames = entryNames.slice(index, index + ZIP_EXTRACTION_BATCH_SIZE);
+            const blobs = await Promise.all(batchNames.map(async (name) => {
+              const entry = zip.files[name];
+              if (!entry || entry.dir) throw new Error(`${name}: ZIP 안의 텍스처를 읽지 못했어요.`);
+              try {
+                return await entry.async("blob");
+              } finally {
+                zip.remove(name);
+              }
+            }));
+            additions.push(...blobs.map((blob, batchIndex) =>
+              makeImportedAsset(relativeTexturePath(batchNames[batchIndex]), blob)
+            ));
           }
         } else if (file.type === "image/png" || file.name.toLowerCase().endsWith(".png")) {
           if (kind === "vanilla") throw new Error("Minecraft Java .jar 또는 리소스팩 .zip 파일을 선택해 주세요.");
@@ -1117,27 +1297,41 @@ function App() {
       const uniqueAdditions = [...new Map(additions.map((asset) => [asset.path.toLowerCase(), asset])).values()];
       const retainedAdditionUrls = new Set(uniqueAdditions.map((asset) => asset.url));
       for (const asset of additions) {
-        if (!retainedAdditionUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
+        if (asset.url && !retainedAdditionUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
       }
       if (kind === "vanilla") {
         const mergedResult = mergeVanillaTextures(uniqueAdditions, imported, edited, preservedEdits, overwriteMatchingEdits);
         const merged = mergedResult.textures;
-        const mergedUrls = new Set(merged.map((asset) => asset.url));
-        for (const asset of uniqueAdditions) {
-          if (!mergedUrls.has(asset.url)) URL.revokeObjectURL(asset.url);
+        try {
+          const replacementPaths = new Set(uniqueAdditions.map((asset) => asset.path.toLowerCase()));
+          const preservedOverrides = merged.filter((asset) =>
+            mergedResult.editedIds.has(asset.id) && !replacementPaths.has(asset.path.toLowerCase())
+          );
+          const storedOverrides = await Promise.all(preservedOverrides.map(async (asset) => toStoredAsset({
+            ...asset,
+            blob: asset.blob ?? await getSavedTextureBlob(asset.path),
+          })));
+          await saveTextureLibrary(
+            [...uniqueAdditions.map(toStoredAsset), ...storedOverrides],
+            merged.map((asset) => asset.path),
+          );
+          await saveSetting(VANILLA_VERSION_SETTING, fileNameWithoutExtension(files[0].name));
+        } catch (error) {
+          throw new Error(error instanceof Error ? `불러온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "불러온 텍스처를 저장소에 저장하지 못했어요");
         }
-        setImported(merged);
+        additions.forEach((asset) => { if (asset.url) URL.revokeObjectURL(asset.url); });
+        setImported(merged.map(withoutTexturePayload));
         committed = true;
         setEdited(mergedResult.editedIds);
-        void saveTextureLibrary(merged).catch((error: unknown) => notify(error instanceof Error ? `불러온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "불러온 텍스처를 저장소에 저장하지 못했어요"));
       } else {
         const byPath = new Map(imported.map((asset) => [asset.path, asset]));
         for (const asset of uniqueAdditions) byPath.set(asset.path, asset);
         const merged = [...byPath.values()];
-        setImported(merged);
+        await saveTextureAssets(uniqueAdditions);
+        additions.forEach((asset) => { if (asset.url) URL.revokeObjectURL(asset.url); });
+        setImported(merged.map(withoutTexturePayload));
         committed = true;
         setEdited((current) => new Set([...current, ...uniqueAdditions.map((asset) => asset.id)]));
-        void saveTextureAssets(uniqueAdditions).catch((error: unknown) => notify(error instanceof Error ? `가져온 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "가져온 텍스처를 저장소에 저장하지 못했어요"));
       }
       setCategory("전체");
       setSearch("");
@@ -1147,7 +1341,7 @@ function App() {
         ? `${fileNameWithoutExtension(files[0].name)} 기본 텍스처 ${uniqueAdditions.length}개를 불러왔어요`
         : `${uniqueAdditions.length}개의 텍스처를 가져왔어요`);
     } catch (error) {
-      if (!committed) additions.forEach((asset) => URL.revokeObjectURL(asset.url));
+      if (!committed) additions.forEach((asset) => { if (asset.url) URL.revokeObjectURL(asset.url); });
       notify(error instanceof Error ? error.message : "파일을 가져오지 못했어요");
     } finally {
       setLoading(false);
@@ -1170,22 +1364,28 @@ function App() {
     };
   }
 
-  function replaceSelectedTexture(file: File | undefined) {
+  async function replaceSelectedTexture(file: File | undefined) {
     if (!selected || !file) return;
     if (file.type !== "image/png" && !file.name.toLowerCase().endsWith(".png")) {
       notify("PNG 이미지 파일만 텍스처로 교체할 수 있어요.");
       return;
     }
     const replacement = { ...makeImportedAsset(selected.path, file), width: selected.width, height: selected.height };
-    const byPath = new Map(imported.map((asset) => [asset.path, asset]));
-    byPath.set(replacement.path, replacement);
-    const updated = [...byPath.values()];
-    setImported(updated);
-    void saveTextureAssets([replacement]).catch((error: unknown) => notify(error instanceof Error ? `교체한 텍스처를 저장소에 저장하지 못했어요: ${error.message}` : "교체한 텍스처를 저장소에 저장하지 못했어요"));
-    setEdited((current) => new Set([...current, replacement.id]));
-    setSelectedId(replacement.id);
-    notify(`${replacement.path} 텍스처를 교체했어요`);
-    if (replaceInput.current) replaceInput.current.value = "";
+    try {
+      await saveTextureAssets([replacement]);
+      if (replacement.url) URL.revokeObjectURL(replacement.url);
+      const byPath = new Map(imported.map((asset) => [asset.path, asset]));
+      byPath.set(replacement.path, withoutTexturePayload(replacement));
+      setImported([...byPath.values()]);
+      setEdited((current) => new Set([...current, replacement.id]));
+      setSelectedId(replacement.id);
+      notify(`${replacement.path} 텍스처를 교체했어요`);
+    } catch (error) {
+      if (replacement.url) URL.revokeObjectURL(replacement.url);
+      notify(error instanceof Error ? `교체한 텍스처를 저장하지 못했어요: ${error.message}` : "교체한 텍스처를 저장하지 못했어요");
+    } finally {
+      if (replaceInput.current) replaceInput.current.value = "";
+    }
   }
 
   async function deleteSelectedTexture() {
@@ -1205,7 +1405,7 @@ function App() {
         return next;
       });
       setSelectedId(updated[0]?.id ?? "");
-      URL.revokeObjectURL(selected.url);
+      if (selected.url) URL.revokeObjectURL(selected.url);
       notify(`${selected.name} 텍스처를 삭제했어요`);
     } catch (error) {
       notify(error instanceof Error ? `텍스처를 삭제하지 못했어요: ${error.message}` : "텍스처를 삭제하지 못했어요");
@@ -1615,10 +1815,11 @@ function App() {
     editorPreviewCanvas.current?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
   }
 
-  function restoreEditorOriginal() {
+  async function restoreEditorOriginal() {
     if (!selected || !editorCanvas.current) return;
     const canvas = editorCanvas.current;
     const image = new Image();
+    let objectUrl: string | undefined;
     image.onload = () => {
       const context = canvas.getContext("2d");
       if (!context) {
@@ -1634,9 +1835,18 @@ function App() {
       setUndoCount(0);
       setRedoCount(0);
       notify("원본 텍스처로 되돌렸어요");
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-    image.onerror = () => notify("원본 텍스처를 다시 불러오지 못했어요.");
-    image.src = selected.url;
+    image.onerror = () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      notify("원본 텍스처를 다시 불러오지 못했어요.");
+    };
+    try {
+      objectUrl = URL.createObjectURL(selected.blob ?? await getSavedTextureBlob(selected.path));
+      image.src = objectUrl;
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "원본 텍스처를 다시 불러오지 못했어요.");
+    }
   }
 
   function zoomEditor(direction: -1 | 1, clientX?: number, clientY?: number) {
@@ -1682,10 +1892,11 @@ function App() {
       const byPath = new Map(imported.map((asset) => [asset.path, asset]));
       byPath.set(path, editedAsset);
       const updated = [...byPath.values()];
-      setImported(updated);
+      await saveTextureAssets([editedAsset]);
+      if (editedAsset.url) URL.revokeObjectURL(editedAsset.url);
+      setImported(updated.map((asset) => asset.id === editedAsset.id ? withoutTexturePayload(asset) : asset));
       setSelectedId(editedAsset.id);
       setEdited((current) => new Set([...current, editedAsset.id]));
-      await saveTextureAssets([editedAsset]);
       setEditorOpen(false);
       notify(`${path} 텍스처를 저장했어요`);
     } catch (error) {
@@ -1709,16 +1920,17 @@ function App() {
     let suffix = 2;
     while (imported.some((asset) => asset.path === path)) path = `${folder}/new_texture_${suffix++}.png`;
     const asset = { ...makeImportedAsset(path, blob), width: 16, height: 16 };
-    const updated = [...imported, asset];
-    setImported(updated);
-    setEdited((current) => new Set([...current, asset.id]));
-    setSelectedId(asset.id);
-    setCategory("전체");
-    setEditorPath(path);
-    setEditorOpen(true);
     try {
       await saveTextureAssets([asset]);
+      if (asset.url) URL.revokeObjectURL(asset.url);
+      setImported([...imported, withoutTexturePayload(asset)]);
+      setEdited((current) => new Set([...current, asset.id]));
+      setSelectedId(asset.id);
+      setCategory("전체");
+      setEditorPath(path);
+      setEditorOpen(true);
     } catch (error) {
+      if (asset.url) URL.revokeObjectURL(asset.url);
       notify(error instanceof Error ? `새 텍스처를 저장하지 못했어요: ${error.message}` : "새 텍스처를 저장하지 못했어요");
     }
   }
@@ -1756,7 +1968,7 @@ function App() {
   }
 
   async function textureBlob(asset: Asset) {
-    return asset.blob;
+    return asset.blob ?? getSavedTextureBlob(asset.path);
   }
 
   async function exportPack(selectedOnly = false) {
@@ -1960,7 +2172,7 @@ function App() {
                   <article key={project.id} className={`saved-project-card ${project.id === activeProjectId ? "saved-project-active" : ""}`}>
                     <div className="saved-project-info">
                       <strong>{project.name}</strong>
-                      <small>{project.pack.version} · {project.assets.length}개 텍스처 · {new Date(project.updatedAt).toLocaleString()}</small>
+                      <small>{project.pack.version} · {project.assetCount}개 텍스처 · {new Date(project.updatedAt).toLocaleString()}</small>
                     </div>
                     {project.id === activeProjectId && <span className="saved-project-current">현재</span>}
                     <div className="saved-project-actions">

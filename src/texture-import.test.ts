@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { mergeVanillaTextures } from "./texture-import";
+import { canReuseVanillaTextures, mergeVanillaTextures } from "./texture-import";
 
 type TestTexture = { id: string; path: string; value: string };
+
+describe("vanilla texture cache", () => {
+  it("reuses a populated cache only for the exact Minecraft version", () => {
+    expect(canReuseVanillaTextures("1.21.4", "1.21.4", 3964)).toBe(true);
+    expect(canReuseVanillaTextures("1.21.4", "1.21.5", 3964)).toBe(false);
+    expect(canReuseVanillaTextures("1.21.4", "1.21.4", 0)).toBe(false);
+    expect(canReuseVanillaTextures(undefined, "1.21.4", 3964)).toBe(false);
+  });
+});
 
 describe("mergeVanillaTextures", () => {
   it("replaces an edited texture on explicit reload while keeping edits outside the source paths", () => {

@@ -1,5 +1,9 @@
 type TextureAsset = { id: string; path: string };
 
+export function canReuseVanillaTextures(cachedVersion: string | undefined, targetVersion: string, cachedTextureCount: number) {
+  return cachedVersion === targetVersion && cachedTextureCount > 0;
+}
+
 export function mergeVanillaTextures<T extends TextureAsset>(
   additions: readonly T[],
   imported: readonly T[],
